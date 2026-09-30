@@ -71,8 +71,8 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 # the container. Leave empty to rely on env vars / local prompts.
 #
 # >>> FILL THESE IN BEFORE PUSHING TO RAILWAY <<<
-HARDCODED_GATEWAY_USER = ""      # decodo username, e.g. "sp12345678"
-HARDCODED_GATEWAY_PASS = ""      # decodo password
+HARDCODED_GATEWAY_USER = "spoaovgfho"      # decodo username, e.g. "sp12345678"
+HARDCODED_GATEWAY_PASS = "3C95VochBi+yxzg4zS"      # decodo password
 HARDCODED_GATEWAY_HOST = "gate.decodo.com"
 HARDCODED_GATEWAY_PORT = 7000
 HARDCODED_TARGET_ACCOUNTS = 0    # 0 = unlimited loop
