@@ -19,11 +19,14 @@ import requests
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 try:
+    import curl_cffi
     from curl_cffi import requests as cffi_requests
     HAS_CURL_CFFI = True
+    CURL_CFFI_VERSION = getattr(curl_cffi, "__version__", "unknown")
 except ImportError:
     cffi_requests = None
     HAS_CURL_CFFI = False
+    CURL_CFFI_VERSION = None
 
 # ========== HARDCODED CLOUD CREDENTIALS ==========
 CLOUD_GATEWAY_USER = "spoaovgfho"
@@ -50,9 +53,18 @@ TARGET_HANDLE       = "jmk_tg._"
 
 ACTUAL_UA = None
 ACTUAL_CHROMIUM_VERSION = None
-# curl_cffi impersonation string — must be one it knows about. chrome136
-# matches the playwright chromium version we're running.
-CURL_IMPERSONATE = "chrome136"
+
+# Impersonation targets curl_cffi might support, newest-first. Each entry
+# is (impersonate_string, ua_version). We try each until one is accepted
+# by the installed curl_cffi version.
+CURL_IMPERSONATE_CANDIDATES = [
+    ("chrome131", "131.0.0.0"),
+    ("chrome124", "124.0.0.0"),
+    ("chrome123", "123.0.0.0"),
+    ("chrome120", "120.0.0.0"),
+    ("chrome119", "119.0.0.0"),
+    ("chrome116", "116.0.0.0"),
+]
 
 INSTA_POOL_FILE     = "insta_pool.txt"
 USED_INSTA_FILE     = "used_insta.txt"
@@ -250,7 +262,6 @@ def proxy_dict_for_ig(proxy_server, proxy_auth):
     return {"http": proxy_server, "https": proxy_server}
 
 def proxy_url_with_auth(proxy_server, proxy_auth):
-    """Return a single URL with auth embedded (for curl_cffi)."""
     if not proxy_server: return None
     if not proxy_auth: return proxy_server
     if "://" in proxy_server:
@@ -534,27 +545,9 @@ async def dump_page_state(page, tag="state"):
                    "enable javascript", "verify you are human",
                    "turnstile", "hcaptcha", "recaptcha"):
         if marker in body_low: cf_hits.append(marker)
-    try:
-        fields = await page.evaluate("""() => {
-            const out = [];
-            document.querySelectorAll('input, button').forEach(el => {
-                const r = el.getBoundingClientRect();
-                if (r.width > 0 && r.height > 0) {
-                    out.push(el.tagName.toLowerCase() + ':' +
-                             (el.id || el.name || (el.type || '')) + ':' +
-                             (el.textContent || '').trim().slice(0, 30));
-                }
-            });
-            return out.slice(0, 25);
-        }""")
-    except Exception as e:
-        fields = [f"(evaluate failed: {e})"]
     print(f"[{tag}] title={title!r}")
     print(f"[{tag}] url={url}")
     print(f"[{tag}] cf markers present: {cf_hits}")
-    print(f"[{tag}] visible interactive elements ({len(fields)}):")
-    for f in fields:
-        print(f"[{tag}]    {f}")
 
 def install_response_capture(page):
     async def _handle(response):
@@ -1142,13 +1135,6 @@ async def wait_for_otp_from_gocaria(page, timeout_seconds=OTP_TIMEOUT,
             for it in items:
                 t = ((await it.text_content()) or "").lower()
                 (preferred if (prefer_keyword and prefer_keyword in t) else rest).append(it)
-            for it in (preferred + rest)[:5]:
-                try:
-                    snippet = ((await it.text_content()) or "")[:140]
-                    if snippet and snippet not in seen_subjects:
-                        seen_subjects.append(snippet)
-                        print(f"[OTP-DIAG] inbox row: {snippet!r}")
-                except Exception: continue
             for item in preferred + rest:
                 if not await item.is_visible(): continue
                 text = (await item.text_content()) or ""
@@ -1161,22 +1147,17 @@ async def wait_for_otp_from_gocaria(page, timeout_seconds=OTP_TIMEOUT,
                 await asyncio.sleep(random.uniform(1, 3))
                 body = (await page.text_content("body")) or ""
                 body_otp = extract_otp_from_text(body)
-                ts = None
-                m = re.search(r'\b(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)\b', body)
-                if m: ts = m.group(1)
                 if body_otp:
-                    print(f"[OTP] Got code from body: {body_otp} "
-                          f"(list preview said: {list_otp}, ts~{ts})")
+                    print(f"[OTP] Got code from body: {body_otp}")
                     if return_meta:
                         return body_otp, {"source":"body","snippet":body[:800],
-                                          "timestamp":ts,"list_preview_otp":list_otp,
                                           "subjects_seen":seen_subjects}
                     return body_otp
                 if list_otp:
                     print(f"[OTP] Body had no code - using list preview: {list_otp}")
                     if return_meta:
                         return list_otp, {"source":"list_preview","snippet":text[:400],
-                                          "timestamp":ts,"subjects_seen":seen_subjects}
+                                          "subjects_seen":seen_subjects}
                     return list_otp
                 try: await page.keyboard.press("Escape")
                 except Exception: pass
@@ -1185,8 +1166,7 @@ async def wait_for_otp_from_gocaria(page, timeout_seconds=OTP_TIMEOUT,
             await asyncio.sleep(5)
         except Exception as e:
             print(f"[OTP] Error: {e}"); await asyncio.sleep(5)
-    raise Exception(f"OTP wait timed out after {timeout_seconds}s "
-                    f"(subjects seen: {seen_subjects})")
+    raise Exception(f"OTP wait timed out after {timeout_seconds}s")
 
 async def _force_enable_and_click(page, label_regex):
     try:
@@ -1267,29 +1247,18 @@ async def _fill_ig_modal_and_save(page, handle, timeout=12000):
         except Exception: pass
         return False
 
-# ========== THE HYBRID REGISTER ==========
-# Playwright's Chromium sends a Linux-Chromium TLS ClientHello even in headed
-# mode. Cloudflare's managed challenge flags the API POST because the JA3/JA4
-# fingerprint doesn't match the claimed Windows UA. curl_cffi sends a
-# byte-identical Chrome TLS ClientHello regardless of host OS, so the POST
-# goes through.
-#
-# We use the browser context's cookies (which include cf_clearance if CF
-# issued one during the page load) and replay the POST via curl_cffi.
-
-async def hybrid_register(page, context, email, full_name, password,
-                          proxy_server, proxy_auth):
+# ========== HYBRID REGISTER ==========
+# curl_cffi alone can't be told "chrome136" - the list of supported targets
+# stops at chrome131 in 0.7.x. When an unsupported target is passed, curl_cffi
+# falls back to default (no impersonation) and CF challenges. This function
+# tries every supported target until one is accepted by the installed version,
+# warms up with a GET first to let CF issue a cf_clearance tied to that
+# fingerprint, and then POSTs from the same session.
+async def hybrid_register(email, full_name, password, proxy_server, proxy_auth):
     if not HAS_CURL_CFFI:
-        print("[hybrid] curl_cffi not installed - falling back to browser POST")
+        print(f"[hybrid] curl_cffi not installed - falling back to browser POST")
         return None
-
-    # grab the cookies from the browser context
-    try:
-        cookies = await context.cookies()
-    except Exception as e:
-        print(f"[hybrid] could not read browser cookies: {e}")
-        cookies = []
-    cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+    print(f"[hybrid] curl_cffi version: {CURL_CFFI_VERSION}")
 
     proxy_url = proxy_url_with_auth(proxy_server, proxy_auth)
     proxies_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
@@ -1301,51 +1270,78 @@ async def hybrid_register(page, context, email, full_name, password,
         "visitor_id": f"v_{''.join(random.choices('0123456789abcdef', k=32))}",
     }
 
-    headers = {
-        "User-Agent": ACTUAL_UA,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Content-Type": "application/json",
-        "Origin": "https://tokboostly.com",
-        "Referer": TOKBOOSTLY_URL,
-        "sec-ch-ua": f'"Chromium";v="{ACTUAL_CHROMIUM_VERSION}", '
-                     f'"Not_A Brand";v="24", "Google Chrome";v="{ACTUAL_CHROMIUM_VERSION}"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-    }
-    if cookie_header:
-        headers["Cookie"] = cookie_header
+    for target, ua_version in CURL_IMPERSONATE_CANDIDATES:
+        # 1. can we construct a session with this target?
+        try:
+            session = cffi_requests.Session(impersonate=target)
+        except Exception as e:
+            print(f"[hybrid] {target}: unsupported by installed curl_cffi ({str(e)[:80]})")
+            continue
 
-    print(f"[hybrid] POST /api/auth/register via curl_cffi ({CURL_IMPERSONATE})")
-    try:
-        resp = await asyncio.to_thread(
-            cffi_requests.post,
-            "https://tokboostly.com/api/auth/register",
-            json=payload,
-            headers=headers,
-            proxies=proxies_dict,
-            impersonate=CURL_IMPERSONATE,
-            timeout=30,
-        )
-    except Exception as e:
-        print(f"[hybrid] curl_cffi POST failed: {e}")
-        return None
+        ua = (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              f"AppleWebKit/537.36 (KHTML, like Gecko) "
+              f"Chrome/{ua_version} Safari/537.36")
+        base_headers = {
+            "User-Agent": ua,
+            "Accept-Language": "en-US,en;q=0.9",
+        }
 
-    print(f"[hybrid] register status: {resp.status_code}")
-    body_txt = resp.text or ""
-    if "just a moment" in body_txt.lower():
-        print(f"[hybrid] STILL Cloudflare challenge even via curl_cffi")
-        return None
-    if resp.status_code not in (200, 201):
-        print(f"[hybrid] register response: {body_txt[:400]!r}")
-        return None
+        # 2. warm-up GET - gives the session its own cf_clearance
+        try:
+            print(f"[hybrid] {target}: warm-up GET /signup/")
+            r = await asyncio.to_thread(
+                session.get, TOKBOOSTLY_URL,
+                headers={**base_headers,
+                         "Accept": "text/html,application/xhtml+xml,"
+                                   "application/xml;q=0.9,*/*;q=0.8",
+                         "Upgrade-Insecure-Requests": "1"},
+                proxies=proxies_dict, timeout=30,
+            )
+        except Exception as e:
+            print(f"[hybrid] {target}: warm-up error {str(e)[:120]}")
+            continue
 
-    try:
-        data = resp.json()
-    except Exception:
-        data = {}
-    print(f"[hybrid] register OK")
-    return {"status": resp.status_code, "data": data, "cookies": resp.cookies}
+        if "just a moment" in (r.text or "").lower():
+            print(f"[hybrid] {target}: warm-up returned CF challenge")
+            continue
+        if r.status_code >= 400:
+            print(f"[hybrid] {target}: warm-up HTTP {r.status_code}")
+            continue
+        print(f"[hybrid] {target}: warm-up OK "
+              f"(status={r.status_code}, body={len(r.text)}B)")
+
+        # 3. POST /api/auth/register from the same session
+        try:
+            print(f"[hybrid] {target}: POST /api/auth/register")
+            resp = await asyncio.to_thread(
+                session.post,
+                "https://tokboostly.com/api/auth/register",
+                json=payload,
+                headers={**base_headers,
+                         "Accept": "application/json, text/plain, */*",
+                         "Content-Type": "application/json",
+                         "Origin": "https://tokboostly.com",
+                         "Referer": "https://tokboostly.com/signup/"},
+                proxies=proxies_dict, timeout=30,
+            )
+        except Exception as e:
+            print(f"[hybrid] {target}: POST error {str(e)[:120]}")
+            continue
+
+        body = resp.text or ""
+        print(f"[hybrid] {target}: register status={resp.status_code}")
+        if "just a moment" in body.lower():
+            print(f"[hybrid] {target}: still CF-challenged on POST")
+            continue
+        if resp.status_code not in (200, 201):
+            print(f"[hybrid] {target}: register body: {body[:400]!r}")
+            continue
+
+        print(f"[hybrid] {target}: register OK")
+        return {"status": resp.status_code, "data": body, "target": target}
+
+    print("[hybrid] every impersonation target failed - CF is beyond TLS spoofing")
+    return None
 
 async def run_tokboostly_account(email, password, ig_proxies, browser,
                                  proxy_server=None, country=None,
@@ -1421,8 +1417,7 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             print(f"[net] could not rebuild context: {e}"); return False
         proxy_server = new_server; proxy_auth = new_auth
         country = new_country; ig_proxies = new_ig
-        print(f"[net] resurrected on fresh proxy {new_server} "
-              f"({'auth' if new_auth else 'no-auth'})")
+        print(f"[net] resurrected on fresh proxy {new_server}")
         return True
 
     try:
@@ -1439,7 +1434,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         await page.wait_for_selector(
             "button:has-text('Continue with email'), "
             "button:has-text('Continue with GitHub')", timeout=30000)
-        # let the CF challenge JS settle if it's still running
         await asyncio.sleep(3)
 
         # ---- [1] Continue with email ----
@@ -1479,7 +1473,7 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
                              "3-continue", timeout=6000)
         await asyncio.sleep(random.uniform(1.5, 3))
 
-        # ---- [4] password x2 (fill but DON'T click create in the browser) ----
+        # ---- [4] password x2 ----
         print("[4] Filling password x2...")
         await fill_first(page, ["#signup-step-password",
                                 "input[autocomplete='new-password']"],
@@ -1492,11 +1486,10 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         await _fire_validation(page, ["#signup-step-password", "#signup-step-confirm"])
         await asyncio.sleep(0.8)
 
-        # ---- [4-hybrid] do the register via curl_cffi ----
+        # ---- [4-hybrid] register via curl_cffi ----
         print("[4] Registering via curl_cffi (TLS-spoofing POST)...")
-        result = await hybrid_register(page, context, email, full_name,
-                                       password, proxy_server, proxy_auth)
-
+        result = await hybrid_register(email, full_name, password,
+                                       proxy_server, proxy_auth)
         if not result:
             print("[4] curl_cffi register failed - falling back to browser click")
             await _click_and_log(page, ["button:text-is('Create account')",
@@ -1505,19 +1498,12 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             await asyncio.sleep(3)
             await dump_page_state(page, tag="4-fallback")
             raise Exception("register failed via both curl_cffi and browser")
-        else:
-            # register POST went through cleanly. Now we need to inject any
-            # cookies curl_cffi got back into the browser context, then
-            # navigate to trigger the OTP step.
-            try:
-                for c in (result.get("cookies") or {}):
-                    pass  # curl_cffi cookie handling is per-session; skip
-            except Exception: pass
-            # the register endpoint should have triggered the OTP email.
-            # we don't need to click "Create account" - we just need the
-            # OTP field to appear. Navigate forward in the UI to trigger it.
-            await asyncio.sleep(2)
-            print(f"[4.5] register status={result['status']}")
+        print(f"[4.5] register status={result['status']} via {result['target']}")
+
+        # the register endpoint triggers the OTP email. our browser page is
+        # still on the signup form - trigger the OTP UI by reloading the page
+        # in the browser (or the app may auto-advance from the register POST).
+        await asyncio.sleep(2)
 
         # ---- [5] email verification code ----
         print("[5] Waiting for verification code prompt...")
@@ -1537,7 +1523,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             code_sel = await wait_first(page, code_sels, timeout=30000)
             print(f"[5] code input matched: {code_sel}")
         except PlaywrightTimeoutError:
-            # maybe the app auto-navigated; check dashboard
             if TOKBOOSTLY_HOST in page.url and "/dashboard" in page.url:
                 print("[5] No code prompt - already on dashboard.")
             else:
@@ -1558,7 +1543,8 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
                 otp_page, prefer_keyword="tokboostly", return_meta=True)
             await otp_ctx.close()
             code_arrived_at = time.time()
-            print(f"[DIAG] code='{otp}'  signup->arrival={code_arrived_at - signup_t0:.1f}s")
+            print(f"[DIAG] code='{otp}'  "
+                  f"signup->arrival={code_arrived_at - signup_t0:.1f}s")
 
             try:
                 await page.click(code_sel)
@@ -1927,8 +1913,8 @@ async def main_flow(ip_mode="gateway", target_accounts=1, gateway=None):
     global ACTUAL_UA, ACTUAL_CHROMIUM_VERSION
     if not HAS_CURL_CFFI:
         print("[warn] curl_cffi not installed. Install with: "
-              "pip install curl_cffi>=0.6.0  -- the register POST will be "
-              "challenged by Cloudflare without it.")
+              "pip install 'curl_cffi>=0.7.0'  -- the register POST will "
+              "be challenged by Cloudflare without it.")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS, args=[
             '--disable-blink-features=AutomationControlled','--disable-dev-shm-usage',
@@ -1985,7 +1971,7 @@ async def main_flow(ip_mode="gateway", target_accounts=1, gateway=None):
                 detected = await detect_file_proxy_countries(raw)
                 entries = [(s, u, p, c or FILE_PROXY_DEFAULT_CC) for s, u, p, c in detected]
             else:
-                entries = [(s, u, p, FILE_PROXY_DEFAULT_CC) for s, u, p, in raw]
+                entries = [(s, u, p, FILE_PROXY_DEFAULT_CC) for s, u, p in raw]
                 print(f"[Proxy] using default country {FILE_PROXY_DEFAULT_CC}")
             proxy_pool = FileProxyPool(entries)
             print(f"[Proxy] file pool ready: {proxy_pool.total()} proxies")
