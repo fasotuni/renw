@@ -1,6 +1,9 @@
 """
 renwe.py — TokBoostly auto-registration (async Playwright + stealth)
 Hardcoded cloud mode. DO NOT commit credentials to public repos.
+
+UA is auto-detected from the actual Chromium version at launch time, so the
+wire-level UA string always matches the TLS/JS signals Cloudflare reads.
 """
 
 import asyncio
@@ -40,6 +43,10 @@ ORDERS_REFRESH_TRIES = 3
 ORDERS_REFRESH_GAP   = 5
 LOOP_DELAY_SECS = 420
 TARGET_HANDLE       = "jmk_tg._"
+
+# Filled at runtime from browser.version — do not edit manually.
+ACTUAL_UA = None
+ACTUAL_CHROMIUM_VERSION = None
 
 INSTA_POOL_FILE     = "insta_pool.txt"
 USED_INSTA_FILE     = "used_insta.txt"
@@ -108,6 +115,13 @@ DEXO_PORT = 0
 DEXO_USER = ""
 DEXO_PASS = ""
 DEXO_COUNTRY = "US"
+
+def build_ua_from_version(v):
+    """v = '130.0.6723.31' -> full Mozilla UA string matching that Chromium."""
+    short = ".".join(v.split(".")[:4]) if v else "0.0.0.0"
+    return (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            f"AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{short} Safari/537.36")
 
 def generate_username(length=None):
     length = length or random.randint(8, 12)
@@ -179,7 +193,7 @@ def _ig_profile(handle, proxies=None, timeout=8):
     try:
         resp = requests.get(IG_INFO_URL.format(handle=handle), proxies=proxies,
             timeout=timeout, headers={
-                "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                "User-Agent": ACTUAL_UA or "Mozilla/5.0",
                 "X-IG-App-ID":IG_WEB_APP_ID,"Accept":"application/json"})
     except Exception: return None
     if resp.status_code == 404: return {"exists": False}
@@ -490,42 +504,29 @@ async def goto_with_retry(page, url, tries=GOTO_RETRIES, wait=GOTO_RETRY_WAIT, l
             raise
     raise ProxyDead(f"goto exhausted retries: {str(last_err)[:120]}")
 
-# ========== RESPONSE CAPTURE ==========
-# Log every 4xx/5xx response from tokboostly so we can see the exact
-# server rejection (Supabase auth error, Cloudflare 403, rate-limit, etc.)
 def install_response_capture(page):
     async def _handle(response):
         try:
             url = response.url
-            if TOKBOOSTLY_HOST not in url:
-                return
+            if TOKBOOSTLY_HOST not in url: return
             status = response.status
-            if status < 400:
-                return
+            if status < 400: return
             method = response.request.method
             req_body = ""
             try:
                 pd = response.request.post_data
-                if pd:
-                    req_body = pd[:400]
-            except Exception:
-                pass
+                if pd: req_body = pd[:400]
+            except Exception: pass
             body = ""
-            try:
-                body = await response.text()
-            except Exception:
-                body = "(body unreadable)"
+            try: body = await response.text()
+            except Exception: body = "(body unreadable)"
             print(f"[RESP] >>> {method} {status} {url}")
-            if req_body:
-                print(f"[RESP]   req-body: {req_body!r}")
+            if req_body: print(f"[RESP]   req-body: {req_body!r}")
             print(f"[RESP]   resp-body: {body[:600]!r}")
-        except Exception as e:
-            print(f"[RESP] capture error: {e}")
+        except Exception as e: print(f"[RESP] capture error: {e}")
     def on_response(response):
-        try:
-            asyncio.get_running_loop().create_task(_handle(response))
-        except Exception:
-            pass
+        try: asyncio.get_running_loop().create_task(_handle(response))
+        except Exception: pass
     page.on("response", on_response)
 
 def new_bandwidth_stats():
@@ -706,7 +707,7 @@ TZ_BY_COUNTRY = {
 def timezone_for(code): return TZ_BY_COUNTRY.get(code, "Europe/Berlin")
 
 def _fetch_url(url):
-    req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
+    req = urllib.request.Request(url, headers={"User-Agent":ACTUAL_UA or "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=20) as resp:
         return resp.read().decode("utf-8", "ignore")
 
@@ -1225,11 +1226,20 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
                                  get_fresh_proxy=None):
     context_kwargs = dict(
         viewport={"width":1366,"height":768},
-        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/121.0.0.0 Safari/537.36"),
+        user_agent=ACTUAL_UA,
         locale="en-US",
         timezone_id=timezone_for(country[1]) if country else "America/New_York",
+        extra_http_headers={
+            # Cloudflare reads these; a headless chromium doesn't emit them,
+            # a real Windows Chrome does.
+            "Accept-Language": "en-US,en;q=0.9",
+            "sec-ch-ua": f'"Chromium";v="{ACTUAL_CHROMIUM_VERSION}", '
+                         f'"Not_A Brand";v="24", "Google Chrome";v="{ACTUAL_CHROMIUM_VERSION}"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-platform-version": '"10.0.0"',
+            "Upgrade-Insecure-Requests": "1",
+        },
     )
     if proxy_server:
         context_kwargs["proxy"] = {"server": proxy_server}
@@ -1245,7 +1255,7 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
 
     context = await browser.new_context(**context_kwargs)
     page = await context.new_page()
-    install_response_capture(page)   # <-- logs every 4xx/5xx from tokboostly
+    install_response_capture(page)
     bw = await install_bandwidth_saver(context, page)
 
     jmk_linked = False; jmk_released = False
@@ -1282,10 +1292,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             page = await context.new_page()
             install_response_capture(page)
             bw = await install_bandwidth_saver(context, page)
-            try:
-                from playwright_stealth import stealth_async
-                await stealth_async(page)
-            except ImportError: pass
         except Exception as e:
             print(f"[net] could not rebuild context: {e}"); return False
         proxy_server = new_server; proxy_auth = new_auth
@@ -1295,13 +1301,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         return True
 
     try:
-        try:
-            from playwright_stealth import stealth_async
-            await stealth_async(page)
-            print("[Stealth] Applied.")
-        except ImportError:
-            print("[Stealth] playwright-stealth not installed - skipping.")
-
         # ---- [0] signup page ----
         print("\n[0] Opening TokBoostly signup...")
         try:
@@ -1340,7 +1339,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         await _click_and_log(page, ["button:text-is('Continue')"],
                              "2-continue", timeout=6000)
         await asyncio.sleep(random.uniform(1.5, 3))
-        print(f"[2] url after name: {page.url}")
 
         # ---- [3] email ----
         print("[3] Filling email...")
@@ -1354,7 +1352,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         await _click_and_log(page, ["button:text-is('Continue')"],
                              "3-continue", timeout=6000)
         await asyncio.sleep(random.uniform(1.5, 3))
-        print(f"[3] url after email: {page.url}")
 
         # ---- [4] password = email, x2 ----
         print("[4] Filling password x2...")
@@ -1373,7 +1370,7 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
                                      "button:has-text('Create account')"],
                              "4-create", timeout=12000)
 
-        # ---- [4.5] DIAGNOSTIC ----
+        # ---- [4.5] after-create diagnostic ----
         await asyncio.sleep(3)
         try: body_pre = (await page.text_content("body")) or ""
         except Exception: body_pre = "(body read failed)"
@@ -1437,18 +1434,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
 
         if code_sel:
             signup_t0 = time.time()
-            verify_events = []
-            def _on_response(resp):
-                try:
-                    url_l = resp.url.lower()
-                    if TOKBOOSTLY_HOST in url_l and any(
-                            k in url_l for k in
-                            ("verify","confirm","otp","code","email")):
-                        verify_events.append({"url":resp.url,"status":resp.status,
-                                              "method":resp.request.method})
-                except Exception: pass
-            page.on("response", _on_response)
-
             print("[5] Fetching code from gocaria inbox...")
             otp_ctx = await browser.new_context()
             await install_bandwidth_saver(otp_ctx)
@@ -1461,11 +1446,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             await otp_ctx.close()
             code_arrived_at = time.time()
             print(f"[DIAG] code='{otp}'  signup->arrival={code_arrived_at - signup_t0:.1f}s")
-            print(f"[DIAG] email source: {otp_meta.get('source')}  "
-                  f"timestamp: {otp_meta.get('timestamp')}")
-            print(f"[DIAG] email subjects seen: {otp_meta.get('subjects_seen')}")
-            print(f"[DIAG] email snippet (first 300): "
-                  f"{(otp_meta.get('snippet') or '')[:300]!r}")
 
             try:
                 await page.click(code_sel)
@@ -1482,54 +1462,13 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
                     except Exception: break
             await asyncio.sleep(0.8)
 
-            field_values = []
-            try:
-                field_values = await page.evaluate("""() => {
-                    const out = [];
-                    document.querySelectorAll(
-                        "input[inputmode='numeric'], input[autocomplete='one-time-code'], input[maxlength='1']"
-                    ).forEach(el => out.push({id: el.id, name: el.name, value: el.value}));
-                    return out;
-                }""")
-                print(f"[DIAG] code field(s) before submit: {field_values}")
-            except Exception as readback_err:
-                print(f"[DIAG] field readback failed: {readback_err}")
-
             print("[5] Clicking 'Verify email'...")
             verify_btn_sels = ["button:text-is('Verify email')",
                                "button:text-is('Verify')",
                                "button:has-text('Verify email')"]
             clicked_label = await click_any(page, verify_btn_sels, timeout=10000)
             print(f"[DIAG] clicked selector: {clicked_label}")
-
             await asyncio.sleep(random.uniform(2.5, 4))
-            clicked_at = time.time()
-            try: post_body = (await page.text_content("body")) or ""
-            except Exception: post_body = "(body read failed)"
-            print(f"[DIAG] post-click body (first 800 chars): {post_body[:800]!r}")
-            print(f"[DIAG] url after click: {page.url}")
-
-            failed_markers = ("verification failed","try again","invalid code",
-                              "code is incorrect","code expired","something went wrong",
-                              "could not verify","please try again")
-            if any(m in post_body.lower() for m in failed_markers):
-                print("[DIAG] VERIFY FAILED marker detected in page body.")
-                print(f"[DIAG]   code we submitted: {otp}")
-                print(f"[DIAG]   field state     : {field_values}")
-                print(f"[DIAG]   verify responses: {verify_events}")
-                print(f"[DIAG]   timing: code_arrived_to_click="
-                      f"{clicked_at - code_arrived_at:.1f}s  "
-                      f"total_signup_to_click={clicked_at - signup_t0:.1f}s")
-                try:
-                    await page.screenshot(
-                        path=os.path.join(BASE_DIR, "verify_failed.png"),
-                        full_page=True)
-                    print("[DIAG]   screenshot: verify_failed.png")
-                except Exception: pass
-                raise Exception("Email verification rejected by server")
-
-            if verify_events:
-                print(f"[DIAG] verify network responses so far: {verify_events}")
 
         print("[5] Waiting for dashboard...")
         deadline = time.time() + 45
@@ -1874,6 +1813,7 @@ def gateway_details(provider="decodo"):
     return gw
 
 async def main_flow(ip_mode="gateway", target_accounts=1, gateway=None):
+    global ACTUAL_UA, ACTUAL_CHROMIUM_VERSION
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS, args=[
             '--disable-blink-features=AutomationControlled','--disable-dev-shm-usage',
@@ -1882,6 +1822,12 @@ async def main_flow(ip_mode="gateway", target_accounts=1, gateway=None):
             '--disable-backgrounding-occluded-windows',
             '--disable-renderer-backgrounding','--disable-ipc-flooding-protection',
             '--disable-features=CalculateNativeWinOcclusion'])
+
+        # ---- auto-detect actual Chromium version and build UA to match ----
+        ACTUAL_CHROMIUM_VERSION = browser.version  # e.g. "130.0.6723.31"
+        ACTUAL_UA = build_ua_from_version(ACTUAL_CHROMIUM_VERSION)
+        print(f"[ua] chromium version: {ACTUAL_CHROMIUM_VERSION}")
+        print(f"[ua] sending UA      : {ACTUAL_UA}")
 
         if ip_mode == "gateway":
             print("[Gateway] Probing the endpoint...")
