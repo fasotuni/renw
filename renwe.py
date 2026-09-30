@@ -54,23 +54,19 @@ TARGET_HANDLE       = "jmk_tg._"
 ACTUAL_UA = None
 ACTUAL_CHROMIUM_VERSION = None
 
+# cURL_cffi impersonation used for ALL tokboostly HTTP traffic (browser
+# requests get intercepted and proxied through curl_cffi so the TLS
+# fingerprint matches the cf_clearance cookie).
+CURL_IMPERSONATE = "chrome131"
+CURL_IMPERSONATE_UA_VERSION = "131.0.0.0"
+# API paths to intercept. Everything else passes through the browser normally.
+INTERCEPT_PATHS = ("/api/",)
+INTERCEPT_HOSTS = ("tokboostly.com",)
+
 CURL_IMPERSONATE_CANDIDATES = [
     ("chrome131", "131.0.0.0"),
     ("chrome124", "124.0.0.0"),
     ("chrome123", "123.0.0.0"),
-]
-
-VERIFY_ENDPOINT_CANDIDATES = [
-    "/api/auth/verify-email",
-    "/api/auth/verify",
-    "/api/auth/confirm-email",
-    "/api/auth/confirm",
-    "/api/auth/otp/verify",
-    "/api/auth/email/verify",
-    "/api/auth/verification/verify",
-    "/api/auth/verify-account",
-    "/api/verify-email",
-    "/api/verify",
 ]
 
 INSTA_POOL_FILE     = "insta_pool.txt"
@@ -555,26 +551,6 @@ async def dump_page_state(page, tag="state"):
     print(f"[{tag}] title={title!r}")
     print(f"[{tag}] url={url}")
     print(f"[{tag}] cf markers present: {cf_hits}")
-
-def install_response_capture(page):
-    async def _handle(response):
-        try:
-            url = response.url
-            if TOKBOOSTLY_HOST not in url: return
-            status = response.status
-            if status < 400: return
-            method = response.request.method
-            body = ""
-            try: body = await response.text()
-            except Exception: body = "(body unreadable)"
-            is_cf = "just a moment" in body.lower()
-            print(f"[RESP] >>> {method} {status} {url}"
-                  + ("  [CLOUDFLARE CHALLENGE]" if is_cf else ""))
-        except Exception as e: print(f"[RESP] capture error: {e}")
-    def on_response(response):
-        try: asyncio.get_running_loop().create_task(_handle(response))
-        except Exception: pass
-    page.on("response", on_response)
 
 def new_bandwidth_stats():
     return {"wire":0,"saved":0,"blocked":0,"from_cache":0,"cached_new":0,"local_urls":set()}
@@ -1254,10 +1230,6 @@ async def _fill_ig_modal_and_save(page, handle, timeout=12000):
         return False
 
 # ========== CURL_CFFI REGISTER + VERIFY ==========
-# NOTE: _cffi_session is a PLAIN SYNC function. It used to be async which
-# caused "cannot unpack non-iterable coroutine object" because to_thread
-# wrapped a coroutine that was never awaited.
-
 def _cffi_session(proxy_server, proxy_auth, target):
     proxy_url = proxy_url_with_auth(proxy_server, proxy_auth)
     proxies_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
@@ -1350,14 +1322,15 @@ async def cffi_verify_email(reg, email, otp):
     ua = reg["ua"]
     if not session:
         print("[cf-verify] no session"); return None
-    for ep in VERIFY_ENDPOINT_CANDIDATES:
+    for ep in [
+        "/api/auth/verify-email", "/api/auth/verify",
+        "/api/auth/confirm-email", "/api/auth/confirm",
+        "/api/auth/otp/verify", "/api/auth/email/verify",
+    ]:
         url = f"https://tokboostly.com{ep}"
-        for payload in (
-            {"email": email, "code": otp},
-            {"email": email, "otp": otp},
-            {"code": otp},
-            {"otp": otp},
-        ):
+        for payload in ({"email": email, "code": otp},
+                        {"email": email, "otp": otp},
+                        {"code": otp}, {"otp": otp}):
             try:
                 r = await asyncio.to_thread(
                     session.post, url, json=payload,
@@ -1368,8 +1341,7 @@ async def cffi_verify_email(reg, email, otp):
                              "Origin": "https://tokboostly.com",
                              "Referer": "https://tokboostly.com/signup/"},
                     proxies=proxies_dict, timeout=30)
-            except Exception as e:
-                print(f"[cf-verify] {ep} {list(payload)[1]} err {str(e)[:60]}")
+            except Exception:
                 continue
             status = r.status_code
             body = (r.text or "")[:200]
@@ -1385,6 +1357,94 @@ async def cffi_verify_email(reg, email, otp):
                 print(f"[cf-verify] {status} on {tag} body={body!r}")
     print("[cf-verify] no verify endpoint succeeded")
     return None
+
+# ========== CURL_CFFI API INTERCEPTOR ==========
+# Every request the browser makes to tokboostly.com/api/* gets intercepted
+# and forwarded through curl_cffi chrome131. This makes the wire TLS
+# fingerprint match the cf_clearance cookie that was issued to that
+# fingerprint, so CF stops challenging the browser's API calls.
+#
+# We use Playwright's context.route to intercept, call curl_cffi from a
+# worker thread, and fulfil the route with the response. The browser never
+# actually makes its own request to CF for API paths.
+
+def _headers_for_cffi(playwright_headers):
+    """Playwright request headers come as a dict; some are forbidden
+    hop-by-hop headers we need to strip before handing to curl_cffi."""
+    drop = {"host", "content-length", "connection", "accept-encoding"}
+    out = {}
+    for k, v in (playwright_headers or {}).items():
+        if k.lower() in drop:
+            continue
+        out[k] = v
+    return out
+
+def _headers_for_browser(cffi_headers):
+    """curl_cffi response headers we pass back to the browser. Strip
+    content-encoding (curl_cffi decoded the body) and hop-by-hop headers."""
+    drop = {"content-encoding", "content-length", "transfer-encoding",
+            "connection", "keep-alive"}
+    out = {}
+    for k, v in (cffi_headers or {}).items():
+        if k.lower() in drop:
+            continue
+        out[k] = v
+    return out
+
+def install_cffi_interceptor(context, proxy_server, proxy_auth):
+    """Intercept /api/* requests to tokboostly, forward via curl_cffi
+    chrome131, fulfil the route with the cffi response."""
+    if not HAS_CURL_CFFI:
+        print("[intercept] curl_cffi missing - API calls will be blocked by CF")
+        return None
+
+    session, proxies_dict, err = _cffi_session(
+        proxy_server, proxy_auth, CURL_IMPERSONATE)
+    if err:
+        print(f"[intercept] session err: {err}"); return None
+    print(f"[intercept] forwarding tokboostly API via curl_cffi {CURL_IMPERSONATE}")
+
+    async def handler(route):
+        request = route.request
+        url = request.url
+        host = urllib.parse.urlparse(url).netloc.lower()
+        path = urllib.parse.urlparse(url).path or "/"
+        if not any(h in host for h in INTERCEPT_HOSTS):
+            await route.continue_(); return
+        if not any(path.startswith(p) for p in INTERCEPT_PATHS):
+            await route.continue_(); return
+
+        method = request.method
+        headers = _headers_for_cffi(request.headers)
+        body = request.post_data
+        try:
+            r = await asyncio.to_thread(
+                session.request, method, url,
+                headers=headers, data=body,
+                proxies=proxies_dict, timeout=30,
+                impersonate=CURL_IMPERSONATE,
+                allow_redirects=False)
+        except Exception as e:
+            print(f"[intercept] {method} {path}: cffi err {str(e)[:80]}")
+            await route.continue_(); return
+
+        resp_headers = _headers_for_browser(dict(r.headers))
+        try:
+            await route.fulfill(
+                status=r.status_code,
+                headers=resp_headers,
+                body=r.content)
+        except Exception as e:
+            print(f"[intercept] fulfil {path}: {str(e)[:80]}")
+            try: await route.continue_()
+            except Exception: pass
+
+    # Register the interceptor. In Playwright, route handlers run LIFO
+    # (last registered wins). We register this AFTER the bandwidth saver,
+    # so this runs FIRST. It skips asset paths (bandwidth saver still
+    # catches those), and only fulfils /api/* tokboostly requests.
+    await context.route("**/*", handler)
+    return session
 
 async def run_tokboostly_account(email, password, ig_proxies, browser,
                                  proxy_server=None, country=None,
@@ -1415,7 +1475,8 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
     final_cookies = (vres["cookies"] if vres else reg["cookies"])
     print(f"[A3] final cookies: {[c['name'] for c in final_cookies]}")
 
-    browser_ver = reg["ua_version"].split(".")[0]
+    # Browser uses the SAME UA as the curl_cffi impersonation so cookie
+    # state and fingerprint stay aligned.
     context_kwargs = dict(
         viewport={"width":1366,"height":768},
         user_agent=reg["ua"],
@@ -1423,9 +1484,9 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         timezone_id=timezone_for(country[1]) if country else "America/New_York",
         extra_http_headers={
             "Accept-Language": "en-US,en;q=0.9",
-            "sec-ch-ua": f'"Chromium";v="{browser_ver}", '
+            "sec-ch-ua": f'"Chromium";v="131", '
                          f'"Not_A Brand";v="24", '
-                         f'"Google Chrome";v="{browser_ver}"',
+                         f'"Google Chrome";v="131"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
             "sec-ch-ua-platform-version": '"10.0.0"',
@@ -1452,9 +1513,15 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         except Exception as e:
             print(f"[B] cookie inject failed: {e}")
 
+    # Install bandwidth saver first, then interceptor. Playwright runs
+    # handlers LIFO so interceptor fires first — it skips non-API paths
+    # and lets bandwidth saver catch assets on the way through.
+    bw = await install_bandwidth_saver(context)
+    await install_cffi_interceptor(context, proxy_server, proxy_auth)
+
     page = await context.new_page()
-    install_response_capture(page)
-    bw = await install_bandwidth_saver(context, page)
+    if bw is not None:
+        await attach_bandwidth_meter(context, page, bw)
 
     jmk_linked = False; jmk_released = False
 
@@ -1486,9 +1553,12 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         if state: new_kwargs["storage_state"] = state
         try:
             context = await browser.new_context(**new_kwargs)
+            bw2 = await install_bandwidth_saver(context)
+            await install_cffi_interceptor(context, new_server, new_auth)
             page = await context.new_page()
-            install_response_capture(page)
-            bw = await install_bandwidth_saver(context, page)
+            if bw2 is not None:
+                await attach_bandwidth_meter(context, page, bw2)
+            bw = bw2
         except Exception as e:
             print(f"[net] rebuild failed: {e}"); return False
         proxy_server = new_server; proxy_auth = new_auth
@@ -1506,27 +1576,11 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
                 await goto_with_retry(page, "https://tokboostly.com/dashboard/",
                                       tries=2, wait=GOTO_RETRY_WAIT, label="B")
             else: raise
-        await asyncio.sleep(3)
+        await asyncio.sleep(4)
         print(f"[B] url now: {page.url}")
+        await dump_page_state(page, tag="B-state")
 
         if "/dashboard" not in page.url:
-            print(f"[B] not on dashboard, trying login. url={page.url}")
-            await goto_with_retry(page, "https://tokboostly.com/login/",
-                                  tries=2, wait=GOTO_RETRY_WAIT, label="B-login")
-            await asyncio.sleep(2)
-            await fill_first(page, ["input[type='email']",
-                                    "input[autocomplete='email']"], email, timeout=8000)
-            await fill_first(page, ["input[type='password']",
-                                    "input[autocomplete='current-password']"],
-                             password, timeout=8000)
-            await _click_and_log(page, ["button:text-is('Sign in')",
-                                         "button:has-text('Sign in')",
-                                         "button[type='submit']"], "B-signin", timeout=8000)
-            await asyncio.sleep(3)
-            print(f"[B] post-signin url: {page.url}")
-
-        if "/dashboard" not in page.url:
-            await dump_page_state(page, tag="B-no-dash")
             raise Exception(f"Could not reach dashboard (at {page.url})")
 
         print(f"[B] On dashboard: {page.url}")
