@@ -1,0 +1,30 @@
+Railway deploy steps
+create a github repo, drop in renwe.py, Dockerfile, requirements.txt, .dockerignore, and commit. .dockerignore:
+
+text
+__pycache__/
+*.pyc
+.venv/
+venv/
+asset_cache/
+*.png
+*.txt.bak
+(keep your proxies.txt, insta_pool.txt, jmk_pending.txt etc. out of the repo — railway persists them via a volume, see step 4.)
+
+railway.app → New Project → Deploy from GitHub repo → pick the repo. railway auto-detects the Dockerfile and builds.
+
+Variables tab → add RENWE_GATEWAY_USER and RENWE_GATEWAY_PASS. Deploy.
+
+persistence — Railway's container filesystem is wiped on every redeploy. you need a Volume mounted at /app so accounts.txt, jmk_pending.txt, used_insta.txt, asset_cache/ survive restarts:
+
+service → Settings → Volumes → New Volume
+
+mount path: /app
+
+redeploy
+
+without this, your jmk_pending.txt alarm state and used-handle ledger vanish on every push, and you'd re-hit handles and re-alarm on JMK links that were already resolved.
+
+logs — the Railway log pane is your stdout. [cloud], [Gateway], [Proxy], [JMK] lines all appear live. the alarm banner is just as loud in the log.
+
+resource sizing — headless chromium peaks around 700–900 MB on tokboostly's dashboard. Railway's Trial gives you 1 GB. it works, but if you see OOM restarts, bump to Hobby (48 GB headroom). the trial credit ($5, 30 days) at ~0.6 GB average and ~0.15 vCPU average lasts roughly 2–3 weeks of continuous uptime.
