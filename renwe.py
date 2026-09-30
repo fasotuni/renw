@@ -35,7 +35,7 @@ TOKBOOSTLY_URL      = "https://tokboostly.com/signup/"
 TOKBOOSTLY_HOST     = "tokboostly.com"
 TOKBOOSTLY_DASH_IG  = "https://tokboostly.com/dashboard/?platform=instagram"
 GOCARIA_URL         = "https://gocaria.my.id"
-HEADLESS            = CLOUD_MODE
+HEADLESS            = False
 OTP_TIMEOUT         = 150
 ORDER_WAIT_SECS     = 30
 POST_ORDER_DELAY    = 120
