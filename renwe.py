@@ -19,8 +19,8 @@ import requests
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ========== HARDCODED CLOUD CREDENTIALS ==========
-CLOUD_GATEWAY_USER = ""      # decodo username
-CLOUD_GATEWAY_PASS = ""      # decodo password
+CLOUD_GATEWAY_USER = "spoaovgfho"      # decodo username
+CLOUD_GATEWAY_PASS = "3C95VochBi+yxzg4zS"      # decodo password
 CLOUD_GATEWAY_HOST = "gate.decodo.com"
 CLOUD_GATEWAY_PORT = 7000
 CLOUD_TARGET_ACCOUNTS = 0
