@@ -9,10 +9,10 @@ IP modes:
   [5] proxies.txt (webshare, static list, cycles through)
 
 CLOUD MODE:
-  Fill in HARDCODED_GATEWAY_USER / HARDCODED_GATEWAY_PASS below (or set
-  RENWE_GATEWAY_USER / RENWE_GATEWAY_PASS as env vars). Either source
-  triggers cloud mode: prompts skipped, headless forced, ip_mode=gateway
-  (decodo), target_accounts defaults to HARDCODED_TARGET_ACCOUNTS.
+  Fill in CLOUD_GATEWAY_USER and CLOUD_GATEWAY_PASS below. If both are
+  non-empty, prompts are skipped, headless is forced, ip_mode=gateway
+  (decodo), target_accounts = CLOUD_TARGET_ACCOUNTS.
+  WARNING: DO NOT COMMIT these to a public repo.
 
 Proxy validation is strict: a proxy enters the pool only if it can
 CONNECT-tunnel to tokboostly.com:443. Additionally, every proxy is
@@ -26,29 +26,8 @@ are carried over into a new browser context, so the login persists and
 the release step can complete. Up to 3 fresh-proxy attempts.
 
 Loop delay:
-  In unlimited mode (accounts = 0), a configurable LOOP_DELAY_SECS
-  pause is inserted after every successful account before the next one
-  starts. Set to 0 to disable. Set via the constant below.
-
-Flow per account:
-  [0] signup -> [1] Continue with email -> [2] name -> [3] email
-  [4] password x2 -> Create account
-  [5] OTP from gocaria inbox -> Verify email
-  [6] dashboard -> Instagram tab -> Connect -> TARGET_HANDLE (jmk_tg._) -> Save
-      ** JMK LINKED: pending entry written to jmk_pending.txt **
-  [7] Gain Followers -> [8] tick terms -> Place order with wallet
-  [9] wait for "Order placed successfully"
-  [9.5] settle: IG dashboard -> Orders -> 3x Refresh (5s apart), idle rest
-  [10] IG dashboard -> Change Profile -> random verified small handle -> Save
-       ** JMK RELEASED: pending entry cleared **
-  [11] accounts.txt: email|password|release_handle (or UNRELEASED)
-
-JMK SAFETY:
-  - on link: jmk_pending.txt gets email|password|ts
-  - on release: entry removed
-  - on failure/interrupt while pending: LOUD alarm + jmk_alerts.txt +
-    accounts.txt writes UNRELEASED as the third field
-  - on startup: any pending entries from a previous run are shouted about
+  In unlimited mode (accounts = 0), LOOP_DELAY_SECS is inserted after
+  every successful account before the next one starts.
 """
 
 import asyncio
@@ -66,23 +45,23 @@ import urllib.parse
 import requests
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# ========== HARDCODED CREDENTIALS (fallback for cloud) ==========
-# Fill these in to guarantee cloud mode works even if env vars don't reach
-# the container. Leave empty to rely on env vars / local prompts.
-#
-# >>> FILL THESE IN BEFORE PUSHING TO RAILWAY <<<
-HARDCODED_GATEWAY_USER = "spoaovgfho"      # decodo username, e.g. "sp12345678"
-HARDCODED_GATEWAY_PASS = "3C95VochBi+yxzg4zS"      # decodo password
-HARDCODED_GATEWAY_HOST = "gate.decodo.com"
-HARDCODED_GATEWAY_PORT = 7000
-HARDCODED_TARGET_ACCOUNTS = 0    # 0 = unlimited loop
-# <<< <<< <<<
+# ========== HARDCODED CLOUD CREDENTIALS ==========
+# >>> FILL THESE IN LOCALLY - NEVER COMMIT THEM TO A PUBLIC REPO <<<
+CLOUD_GATEWAY_USER = ""      # decodo username, e.g. "sp12345678"
+CLOUD_GATEWAY_PASS = ""      # decodo password
+CLOUD_GATEWAY_HOST = "gate.decodo.com"
+CLOUD_GATEWAY_PORT = 7000
+CLOUD_TARGET_ACCOUNTS = 0    # 0 = unlimited loop
+# <<<
+
+CLOUD_MODE = bool(CLOUD_GATEWAY_USER.strip() and CLOUD_GATEWAY_PASS.strip())
 
 # ========== CONFIGURATION ==========
 TOKBOOSTLY_URL      = "https://tokboostly.com/signup/"
 TOKBOOSTLY_HOST     = "tokboostly.com"
 TOKBOOSTLY_DASH_IG  = "https://tokboostly.com/dashboard/?platform=instagram"
 GOCARIA_URL         = "https://gocaria.my.id"
+HEADLESS            = CLOUD_MODE   # forced headless in cloud mode
 OTP_TIMEOUT         = 150
 ORDER_WAIT_SECS     = 30
 POST_ORDER_DELAY    = 120
@@ -192,41 +171,6 @@ DEXO_USER = ""
 DEXO_PASS = ""
 DEXO_COUNTRY = "US"
 
-# ========== CLOUD / RAILWAY MODE ==========
-# Triggered by env vars OR by the hardcoded constants at the top of the file.
-# Env vars win if both are present.
-_env_user = os.environ.get("RENWE_GATEWAY_USER", "").strip()
-_env_pass = os.environ.get("RENWE_GATEWAY_PASS", "").strip()
-
-CLOUD_GATEWAY_USER = _env_user or HARDCODED_GATEWAY_USER.strip()
-CLOUD_GATEWAY_PASS = _env_pass or HARDCODED_GATEWAY_PASS.strip()
-CLOUD_GATEWAY_HOST = (os.environ.get("RENWE_GATEWAY_HOST", "").strip()
-                      or HARDCODED_GATEWAY_HOST)
-try:
-    CLOUD_GATEWAY_PORT = int(os.environ.get("RENWE_GATEWAY_PORT", "").strip()
-                             or str(HARDCODED_GATEWAY_PORT))
-except ValueError:
-    CLOUD_GATEWAY_PORT = HARDCODED_GATEWAY_PORT
-
-try:
-    CLOUD_TARGET_ACCOUNTS = int(os.environ.get("RENWE_TARGET_ACCOUNTS", "").strip()
-                                or str(HARDCODED_TARGET_ACCOUNTS))
-except ValueError:
-    CLOUD_TARGET_ACCOUNTS = HARDCODED_TARGET_ACCOUNTS
-if CLOUD_TARGET_ACCOUNTS < 0:
-    CLOUD_TARGET_ACCOUNTS = 0
-
-CLOUD_MODE = bool(CLOUD_GATEWAY_USER)
-
-# HEADLESS: env override → cloud mode → default visible
-_env_headless = os.environ.get("RENWE_HEADLESS", "").strip().lower()
-if _env_headless in ("1", "true", "yes", "on"):
-    HEADLESS = True
-elif CLOUD_MODE:
-    HEADLESS = True
-else:
-    HEADLESS = False
-
 # ========== UTILITY ==========
 
 def generate_username(length=None):
@@ -258,7 +202,7 @@ def random_person_name():
     return f"{first} {last}"
 
 
-# ---------- Instagram handle sourcing (for rotation/closing) ----------
+# ---------- Instagram handle sourcing ----------
 
 def _used_handles_path():
     return os.path.join(BASE_DIR, USED_INSTA_FILE)
@@ -495,16 +439,13 @@ async def detect_file_proxy_countries(entries):
     return results
 
 
-# ========== PROXY PREFLIGHT (real CONNECT tunnel test) ==========
+# ========== PROXY PREFLIGHT ==========
 
 class ProxyDead(Exception):
-    """This proxy stopped tunnelling between validation and use. Free proxies
-    die in seconds; this exception means swap to the next one and retry."""
     pass
 
 
 def _split_proxy_url(proxy_url):
-    """'scheme://user:pass@host:port' -> (scheme, host, port, user, pw) or None."""
     if not proxy_url:
         return None
     if "://" in proxy_url:
@@ -636,7 +577,7 @@ def set_jmk_pending(email, password):
         with open(_jmk_pending_path(), "a", encoding="utf-8") as f:
             f.write(f"{email}|{password}|{int(time.time())}\n")
     except OSError as e:
-        print(f"[JMK] ⚠️ could not append to {JMK_PENDING_FILE}: {e}")
+        print(f"[JMK] could not append to {JMK_PENDING_FILE}: {e}")
 
 
 def clear_jmk_pending(email):
@@ -657,7 +598,7 @@ def clear_jmk_pending(email):
         else:
             os.remove(path)
     except OSError as e:
-        print(f"[JMK] ⚠️ could not update {JMK_PENDING_FILE}: {e}")
+        print(f"[JMK] could not update {JMK_PENDING_FILE}: {e}")
 
 
 def _append_jmk_alert(email, password, reason):
@@ -666,7 +607,7 @@ def _append_jmk_alert(email, password, reason):
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
             f.write(f"{ts}|UNRELEASED|{email}|{password}|{reason}\n")
     except OSError as e:
-        print(f"[JMK] ⚠️ could not append to {JMK_ALERTS_FILE}: {e}")
+        print(f"[JMK] could not append to {JMK_ALERTS_FILE}: {e}")
 
 
 def alarm_jmk_linked(email, password, reason=""):
@@ -675,7 +616,7 @@ def alarm_jmk_linked(email, password, reason=""):
 
     bar = "!" * 78
     print("\n" + bar)
-    print("🚨  ATTENTION  🚨   JMK_TG._ IS STILL LINKED TO AN ACCOUNT   🚨  ATTENTION  🚨")
+    print("!!  ATTENTION  !!   JMK_TG._ IS STILL LINKED TO AN ACCOUNT   !!  ATTENTION  !!")
     print(bar)
     print(f"  The target handle @{TARGET_HANDLE} was linked to this account")
     print(f"  and the release/rotation step did NOT complete.")
@@ -708,8 +649,8 @@ def check_jmk_pending_at_startup():
 
     bar = "!" * 78
     print("\n" + bar)
-    print(f"🚨  PREVIOUS RUN LEFT @{TARGET_HANDLE} LINKED TO "
-          f"{len(entries)} ACCOUNT(S)  🚨")
+    print(f"!!  PREVIOUS RUN LEFT @{TARGET_HANDLE} LINKED TO "
+          f"{len(entries)} ACCOUNT(S)  !!")
     print(bar)
     for ln in entries:
         email = ln.split("|", 1)[0] if "|" in ln else ln
@@ -1150,7 +1091,7 @@ def check_proxy(proxy_url):
     return check_proxy_strict(proxy_url)
 
 
-# ========== FREE PROXY POOL (background refill, cache-backed) ==========
+# ========== FREE PROXY POOL ==========
 
 def _proxy_cache_path():
     return os.path.join(BASE_DIR, PROXY_CACHE_FILE)
@@ -1992,4 +1933,938 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
                     await asyncio.to_thread(input, "Press Enter after solving...")
                     break
             except Exception as probe_err:
-                if C
+                if CLOUD_MODE and "captcha shown in headless" in str(probe_err):
+                    raise
+            await asyncio.sleep(2)
+
+        # ---- [5] email verification code ----
+        print("[5] Waiting for verification code prompt...")
+        code_sels = [
+            "input[inputmode='numeric'][placeholder*='6']",
+            "input[placeholder*='6-digit']",
+            "input[autocomplete='one-time-code']",
+            "input[inputmode='numeric']",
+        ]
+        code_sel = None
+        try:
+            code_sel = await wait_first(page, code_sels, timeout=25000)
+        except PlaywrightTimeoutError:
+            if TOKBOOSTLY_HOST in page.url and "/dashboard" in page.url:
+                print("[5] No code prompt - already on dashboard.")
+            else:
+                raise
+
+        if code_sel:
+            signup_t0 = time.time()
+
+            verify_events = []
+
+            def _on_response(resp):
+                try:
+                    url_l = resp.url.lower()
+                    if TOKBOOSTLY_HOST in url_l and any(
+                            k in url_l for k in
+                            ("verify", "confirm", "otp", "code", "email")):
+                        verify_events.append({
+                            "url": resp.url,
+                            "status": resp.status,
+                            "method": resp.request.method,
+                        })
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+
+            print("[5] Fetching code from gocaria inbox...")
+            otp_ctx = await browser.new_context()
+            await install_bandwidth_saver(otp_ctx)
+            otp_page = await otp_ctx.new_page()
+
+            await otp_page.goto(f"{GOCARIA_URL}/{email}",
+                                timeout=30000, wait_until="domcontentloaded")
+            await asyncio.sleep(random.uniform(1, 2))
+
+            otp, otp_meta = await wait_for_otp_from_gocaria(
+                otp_page, prefer_keyword="tokboostly", return_meta=True)
+            await otp_ctx.close()
+
+            code_arrived_at = time.time()
+            print(f"[DIAG] code='{otp}'  "
+                  f"signup->arrival={code_arrived_at - signup_t0:.1f}s")
+            print(f"[DIAG] email source: {otp_meta.get('source')}  "
+                  f"timestamp: {otp_meta.get('timestamp')}")
+            print(f"[DIAG] email subjects seen: "
+                  f"{otp_meta.get('subjects_seen')}")
+            print(f"[DIAG] email snippet (first 300): "
+                  f"{(otp_meta.get('snippet') or '')[:300]!r}")
+
+            try:
+                await page.click(code_sel)
+                await page.fill(code_sel, "")
+                await page.type(code_sel, otp, delay=random.uniform(60, 140))
+            except Exception as fill_err:
+                print(f"[DIAG] primary fill failed ({fill_err}) - trying split boxes")
+                boxes = await page.query_selector_all(
+                    "input[inputmode='numeric'], input[maxlength='1']")
+                for i, digit in enumerate(otp):
+                    if i >= len(boxes):
+                        break
+                    try:
+                        await boxes[i].fill(digit)
+                        await asyncio.sleep(0.1)
+                    except Exception:
+                        break
+            await asyncio.sleep(0.8)
+
+            field_values = []
+            try:
+                field_values = await page.evaluate("""() => {
+                    const out = [];
+                    document.querySelectorAll(
+                        "input[inputmode='numeric'], input[autocomplete='one-time-code'], input[maxlength='1']"
+                    ).forEach(el => out.push({id: el.id, name: el.name, value: el.value}));
+                    return out;
+                }""")
+                print(f"[DIAG] code field(s) before submit: {field_values}")
+            except Exception as readback_err:
+                print(f"[DIAG] field readback failed: {readback_err}")
+
+            try:
+                pre_body = (await page.text_content("body")) or ""
+                print(f"[DIAG] pre-submit page (first 400 chars): "
+                      f"{pre_body[:400]!r}")
+            except Exception:
+                pass
+
+            print("[5] Clicking 'Verify email'...")
+            verify_btn_sels = [
+                "button:text-is('Verify email')",
+                "button:text-is('Verify')",
+                "button:has-text('Verify email')",
+            ]
+            clicked_label = await click_any(page, verify_btn_sels, timeout=10000)
+            print(f"[DIAG] clicked selector: {clicked_label}")
+
+            await asyncio.sleep(random.uniform(2.5, 4))
+            clicked_at = time.time()
+
+            try:
+                post_body = (await page.text_content("body")) or ""
+            except Exception:
+                post_body = "(body read failed)"
+
+            print(f"[DIAG] post-click body (first 800 chars): "
+                  f"{post_body[:800]!r}")
+            print(f"[DIAG] url after click: {page.url}")
+
+            failed_markers = ("verification failed", "try again",
+                              "invalid code", "code is incorrect",
+                              "code expired", "something went wrong",
+                              "could not verify", "please try again")
+            if any(m in post_body.lower() for m in failed_markers):
+                print("[DIAG] VERIFY FAILED marker detected in page body.")
+                print(f"[DIAG]   code we submitted: {otp}")
+                print(f"[DIAG]   email source    : {otp_meta.get('source')}")
+                print(f"[DIAG]   list preview otp: {otp_meta.get('list_preview_otp')}")
+                print(f"[DIAG]   email timestamp : {otp_meta.get('timestamp')}")
+                print(f"[DIAG]   field state     : {field_values}")
+                print(f"[DIAG]   verify responses: {verify_events}")
+                print(f"[DIAG]   timing: code_arrived_to_click="
+                      f"{clicked_at - code_arrived_at:.1f}s  "
+                      f"total_signup_to_click={clicked_at - signup_t0:.1f}s")
+                try:
+                    await page.screenshot(
+                        path=os.path.join(BASE_DIR, "verify_failed.png"),
+                        full_page=True)
+                    print("[DIAG]   screenshot: verify_failed.png")
+                except Exception:
+                    pass
+                raise Exception("Email verification rejected by server "
+                                "(see [DIAG] lines above)")
+
+            if verify_events:
+                print(f"[DIAG] verify network responses so far: {verify_events}")
+
+        # wait for the dashboard
+        print("[5] Waiting for dashboard...")
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            if TOKBOOSTLY_HOST in page.url and "/dashboard" in page.url:
+                break
+            await asyncio.sleep(1)
+        else:
+            raise Exception(f"Never reached dashboard (still at {page.url})")
+        print(f"[5] On dashboard: {page.url}")
+
+        if SAVE_BANDWIDTH:
+            try:
+                await page.evaluate("window.stop()")
+            except Exception:
+                pass
+        await asyncio.sleep(2)
+
+        # ---- [6] Instagram tab -> Connect Instagram -> TARGET_HANDLE ----
+        print("[6] Switching to Instagram tab...")
+        clicked_tab = await click_any(page, [
+            "a[role='tab'][href*='platform=instagram']",
+            "a[role='tab']:has-text('Instagram')",
+            "a:has-text('Instagram')",
+        ], timeout=15000)
+        if not clicked_tab:
+            print("[6] Instagram tab not found - navigating directly.")
+            await goto_with_retry(page, TOKBOOSTLY_DASH_IG,
+                                  tries=2, wait=GOTO_RETRY_WAIT, label="6")
+        await asyncio.sleep(random.uniform(2, 3))
+
+        print(f"[6] Connecting Instagram -> @{TARGET_HANDLE} (target handle)")
+        connected_target = False
+        for attempt_i in range(INSTA_MAX_TRIES):
+            opened = await click_any(page, [
+                "button:has-text('Connect Instagram')",
+                "button:has-text('Change Profile')",
+                "button:has-text('Connect')",
+            ], timeout=10000)
+            if not opened:
+                print("[6] Could not open Instagram connect UI.")
+            await asyncio.sleep(random.uniform(1.5, 2.5))
+
+            result = await _fill_ig_modal_and_save(page, TARGET_HANDLE)
+            if result is True:
+                connected_target = True
+                print(f"[6] OK Target handle @{TARGET_HANDLE} accepted.")
+                break
+            if result is None:
+                connected_target = True
+                print(f"[6] No modal appeared - assuming @{TARGET_HANDLE} "
+                      f"already linked.")
+                break
+            print(f"[6] Tokboostly rejected @{TARGET_HANDLE}, retrying "
+                  f"({attempt_i + 1}/{INSTA_MAX_TRIES})...")
+            await asyncio.sleep(random.uniform(1.5, 2.5))
+
+        if not connected_target:
+            raise Exception(f"Target handle @{TARGET_HANDLE} could not be "
+                            f"linked after {INSTA_MAX_TRIES} attempts")
+
+        jmk_linked = True
+        set_jmk_pending(email, password)
+        print(f"[JMK] @{TARGET_HANDLE} linked to {email} - "
+              f"pending entry written to {JMK_PENDING_FILE}")
+
+        await asyncio.sleep(random.uniform(2, 3.5))
+
+        # ---- [7] Grow Followers ----
+        print("[7] Clicking 'Gain Followers'...")
+        clicked = await click_any(page, [
+            "a[href*='instagram-followers']",
+            "a:has-text('Gain Followers')",
+            "a:has-text('Grow Followers')",
+        ], timeout=15000)
+        if not clicked:
+            raise Exception("Could not find 'Gain Followers' link")
+        await asyncio.sleep(random.uniform(2, 4))
+
+        # ---- [8] Checkout ----
+        print("[8] Ticking ToS checkbox...")
+        try:
+            cbs = await page.query_selector_all("input[type='checkbox']")
+            for cb in cbs:
+                try:
+                    if not await cb.is_checked():
+                        await cb.check()
+                        break
+                except Exception:
+                    continue
+            print("[8] ToS ticked.")
+        except Exception as e:
+            print(f"[8] checkbox warning: {e}")
+        await asyncio.sleep(1)
+
+        print("[8] Waiting for 'Place order with wallet' to become enabled...")
+        deadline = time.time() + 30
+        ready = False
+        while time.time() < deadline:
+            btn = await page.query_selector(
+                "button:has-text('Place order with wallet')")
+            if btn and await btn.is_enabled():
+                ready = True
+                break
+            await asyncio.sleep(1)
+        if not ready:
+            print("[8] Button still disabled - force-clicking once.")
+            await _force_enable_and_click(page, "place order with wallet")
+        else:
+            await click_any(page, [
+                "button:has-text('Place order with wallet')",
+                "button:text-is('Place order')",
+            ], timeout=8000)
+
+        # ---- [9] success ----
+        print("[9] Waiting for success message...")
+        deadline = time.time() + ORDER_WAIT_SECS
+        success = False
+        order_id = "unknown"
+        while time.time() < deadline:
+            try:
+                body = (await page.text_content("body")) or ""
+                if "order placed successfully" in body.lower():
+                    m = re.search(r'ID #([0-9a-f\-]+)', body, re.IGNORECASE)
+                    order_id = m.group(1) if m else "unknown"
+                    success = True
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+        if success:
+            print(f"[9] OK Order placed successfully. ID: {order_id}")
+        else:
+            print("[9] No explicit success message within window.")
+
+        # ---- [9.5] settle window --------------------------------------
+        settle_t0 = time.time()
+        print(f"[9.5] Settle window: {POST_ORDER_DELAY}s total, "
+              f"Orders-refresh routine up first.")
+        try:
+            print(f"[9.5] Navigating to {TOKBOOSTLY_DASH_IG}")
+            try:
+                await goto_with_retry(page, TOKBOOSTLY_DASH_IG,
+                                      tries=GOTO_RETRIES,
+                                      wait=GOTO_RETRY_WAIT, label="9.5")
+            except ProxyDead:
+                print("[9.5] tunnel died on goto - resurrecting")
+                if await _resurrect():
+                    await goto_with_retry(page, TOKBOOSTLY_DASH_IG,
+                                          tries=2, wait=GOTO_RETRY_WAIT,
+                                          label="9.5")
+                else:
+                    raise
+            await asyncio.sleep(random.uniform(1.5, 2.5))
+            print(f"[9.5] url now: {page.url}")
+
+            clicked_orders = await click_any(page, [
+                "button:has-text('Orders')",
+                "a:has-text('Orders')",
+            ], timeout=10000)
+            if clicked_orders:
+                print(f"[9.5] Clicked Orders ({clicked_orders})")
+            else:
+                print("[9.5] Orders button not found - skipping refresh loop.")
+            await asyncio.sleep(random.uniform(1.5, 2.5))
+
+            if clicked_orders:
+                for i in range(ORDERS_REFRESH_TRIES):
+                    refreshed = await click_any(page, [
+                        "button:text-is('Refresh')",
+                        "button:has-text('Refresh')",
+                    ], timeout=8000)
+                    if refreshed:
+                        print(f"[9.5] Orders refresh "
+                              f"{i + 1}/{ORDERS_REFRESH_TRIES} clicked")
+                    else:
+                        print(f"[9.5] Orders refresh button not found "
+                              f"on try {i + 1}")
+                    if i < ORDERS_REFRESH_TRIES - 1:
+                        await asyncio.sleep(ORDERS_REFRESH_GAP)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as settle_err:
+            print(f"[9.5] settle routine warning: {settle_err}")
+
+        elapsed = time.time() - settle_t0
+        remainder = max(0, POST_ORDER_DELAY - int(elapsed))
+        if remainder > 0:
+            print(f"[9.5] {remainder}s of settle window left - waiting...")
+            try:
+                await countdown_sleep(remainder, label="9.5")
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise
+        else:
+            print("[9.5] Settle window already elapsed - moving on.")
+
+        # ---- [10] Head back to the instagram dashboard, change profile ----
+        print(f"[10] Navigating back to {TOKBOOSTLY_DASH_IG}")
+        release_handle = None
+
+        rotated = False
+        last_rot_err = None
+        for outer_try in range(RESURRECT_MAX_TRIES):
+            if rotated:
+                break
+            try:
+                try:
+                    await goto_with_retry(page, TOKBOOSTLY_DASH_IG,
+                                          tries=GOTO_RETRIES,
+                                          wait=GOTO_RETRY_WAIT, label="10")
+                except ProxyDead:
+                    print(f"[10] goto tunnel dead (outer try "
+                          f"{outer_try + 1}/{RESURRECT_MAX_TRIES}) - resurrecting")
+                    if await _resurrect():
+                        await goto_with_retry(page, TOKBOOSTLY_DASH_IG,
+                                              tries=2, wait=GOTO_RETRY_WAIT,
+                                              label="10")
+                    else:
+                        print("[10] no fresh proxy available")
+                        last_rot_err = "goto tunnel dead, no fresh proxy"
+                        continue
+                await asyncio.sleep(random.uniform(2, 3))
+                print(f"[10] url now: {page.url}")
+
+                for rot_try in range(INSTA_MAX_TRIES):
+                    candidate = await asyncio.to_thread(
+                        pick_rotation_handle, ig_proxies, {TARGET_HANDLE})
+                    if not candidate:
+                        print("[10] Could not source a rotation handle - skipping.")
+                        break
+                    print(f"[10] Candidate #{rot_try + 1}: @{candidate}")
+
+                    card_ready = False
+                    for _ in range(20):
+                        btn = await page.query_selector(
+                            "button:has-text('Change Profile')")
+                        if btn and await btn.is_visible():
+                            card_ready = True
+                            break
+                        await asyncio.sleep(0.5)
+                    if not card_ready:
+                        print("[10] 'Change Profile' button never appeared.")
+                        last_rot_err = "Change Profile button never appeared"
+                        break
+
+                    opened = await click_any(page, [
+                        "button:has-text('Change Profile')",
+                    ], timeout=8000)
+                    if not opened:
+                        print("[10] Could not click 'Change Profile'.")
+                        last_rot_err = "could not click Change Profile"
+                        break
+                    await asyncio.sleep(random.uniform(1, 2))
+
+                    result = await _fill_ig_modal_and_save(page, candidate)
+                    if result is True:
+                        print(f"[10] OK Released to @{candidate}")
+                        release_handle = candidate
+                        mark_handle_used(candidate)
+                        rotated = True
+                        break
+                    if result is None:
+                        print("[10] No modal appeared after Change Profile.")
+                        last_rot_err = "no modal after Change Profile"
+                        break
+                    print(f"[10] Rotation rejected @{candidate}, re-rolling...")
+                    await asyncio.sleep(random.uniform(1, 2))
+
+                if rotated:
+                    break
+                print(f"[10] outer attempt {outer_try + 1} failed "
+                      f"({last_rot_err}) - trying again")
+                if not await _resurrect():
+                    print("[10] cannot resurrect - giving up on this account")
+                    break
+                await asyncio.sleep(random.uniform(1, 2))
+
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except ProxyDead as pd:
+                print(f"[10] ProxyDead on outer try {outer_try + 1}: {pd}")
+                last_rot_err = f"proxy dead: {pd}"
+                if not await _resurrect():
+                    print("[10] cannot resurrect - giving up on this account")
+                    break
+                await asyncio.sleep(random.uniform(1, 2))
+            except Exception as rot_err:
+                print(f"[10] rotation warning: {rot_err}")
+                last_rot_err = str(rot_err)
+                break
+
+        if rotated:
+            jmk_released = True
+            clear_jmk_pending(email)
+            print(f"[JMK] @{TARGET_HANDLE} released from {email} - "
+                  f"pending entry cleared.")
+        else:
+            print("[10] Rotation did not complete - "
+                  f"@{TARGET_HANDLE} is STILL linked to {email}.")
+            alarm_jmk_linked(email, password,
+                             f"rotation did not complete in [10]: "
+                             f"{last_rot_err or 'unknown'}")
+        await asyncio.sleep(random.uniform(1.5, 3))
+
+        print("\n" + "=" * 50)
+        if jmk_released:
+            print("OK ACCOUNT COMPLETE")
+        else:
+            print("!!  ACCOUNT COMPLETE BUT @jmk_tg._ WAS NOT RELEASED")
+        print(f"   Email:            {email}")
+        print(f"   Password:         {password}")
+        print(f"   Ordered on:       @{TARGET_HANDLE}")
+        print(f"   Released to:      @{release_handle if release_handle else '(none)'}")
+        print(f"   Country:          {country[1] if country else 'direct'}")
+        print("=" * 50)
+
+        if jmk_released:
+            third = release_handle or "(unknown)"
+        else:
+            third = "UNRELEASED"
+        with open(os.path.join(BASE_DIR, "accounts.txt"), "a", encoding="utf-8") as f:
+            f.write(f"{email}|{password}|{third}\n")
+
+        await _safe_close(context)
+        return True
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        if jmk_linked and not jmk_released:
+            alarm_jmk_linked(email, password, "interrupted (Ctrl+C / cancel)")
+        await _safe_close(context)
+        raise
+
+    except ProxyDead:
+        if jmk_linked and not jmk_released:
+            alarm_jmk_linked(email, password, "proxy died mid-flow")
+        await _safe_close(context)
+        raise
+
+    except Exception as e:
+        if jmk_linked and not jmk_released:
+            alarm_jmk_linked(email, password, f"failed: {e}")
+        saved = await _safe_screenshot(page, os.path.join(BASE_DIR, "error_screenshot.png"))
+        print(f"\nAccount failed: {e}")
+        if saved:
+            print("Screenshot saved: error_screenshot.png")
+        await _safe_close(context)
+        raise
+
+    finally:
+        report_bandwidth(bw, f"attempt for {email}")
+        if bw and bw_totals is not None:
+            bw_totals["wire"] += bw["wire"]
+            bw_totals["saved"] += bw["saved"]
+            bw_totals["attempts"] += 1
+
+
+# ========== STARTUP PROMPTS ==========
+
+def prompt_options():
+    print("\nSETUP")
+    print("-" * 50)
+    while True:
+        choice = input(
+            "IP mode:\n"
+            "  [1] My own IP\n"
+            "  [2] Free proxy lists (background refill)\n"
+            "  [3] Custom gateway (Decodo US)\n"
+            "  [4] Dexodata\n"
+            "  [5] proxies.txt (webshare / static file)\n"
+            "Choice (default 3): "
+        ).strip() or "3"
+        if choice == "1":
+            ip_mode = "direct"; provider = None; break
+        if choice == "2":
+            ip_mode = "lists"; provider = None; break
+        if choice == "3":
+            ip_mode = "gateway"; provider = "decodo"; break
+        if choice == "4":
+            ip_mode = "gateway"; provider = "dexodata"; break
+        if choice == "5":
+            ip_mode = "file"; provider = None; break
+        print("Please enter 1, 2, 3, 4 or 5.")
+    gateway = None
+    if ip_mode == "gateway":
+        gateway = gateway_details(provider)
+    while True:
+        choice = input("Accounts - [1] One  [2] Specific number  "
+                       "[3] Unlimited loop (default 1): ").strip() or "1"
+        if choice == "1":
+            return ip_mode, 1, gateway
+        if choice == "2":
+            n = input("How many accounts? ").strip()
+            if n.isdigit() and int(n) > 0:
+                return ip_mode, int(n), gateway
+            print("Enter a positive number.")
+        elif choice == "3":
+            return ip_mode, 0, gateway
+        else:
+            print("Please enter 1, 2 or 3.")
+
+
+def gateway_details(provider="decodo"):
+    if provider == "dexodata":
+        host, port, user, pw = DEXO_HOST, DEXO_PORT, DEXO_USER, DEXO_PASS
+        tag = "Dexodata"
+    else:
+        host, port, user, pw = GATEWAY_HOST, GATEWAY_PORT, GATEWAY_USER, GATEWAY_PASS
+        tag = "Gateway"
+    h = input(f"{tag} host" + (f" (default {host})" if host else "") + ": ").strip()
+    if h:
+        host = h
+    p = input(f"{tag} port" + (f" (default {port})" if port else "") + ": ").strip()
+    if p:
+        try:
+            port = int(p)
+        except ValueError:
+            print("Port must be a number - keeping default.")
+    if not user:
+        user = input(f"{tag} username: ").strip()
+    if not pw:
+        pw = input(f"{tag} password: ").strip()
+    if provider != "dexodata" and user.startswith("user-"):
+        user = user[5:]
+    gw = {"host": host, "port": port, "user": user, "pass": pw, "provider": provider}
+    if provider == "dexodata":
+        cc = input("Country code pinned in your dashboard (default US): ").strip().upper() or (DEXO_COUNTRY or "US")
+        gw["country"] = cc
+    else:
+        print(f"[Decodo] Gateway mode pinned to: {GATEWAY_COUNTRIES[0][0]} (US)")
+    return gw
+
+
+# ========== MAIN ==========
+
+async def main_flow(ip_mode="gateway", target_accounts=1, gateway=None):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--disable-ipc-flooding-protection',
+                '--disable-features=CalculateNativeWinOcclusion',
+            ]
+        )
+
+        if ip_mode == "gateway":
+            print("[Gateway] Probing the endpoint...")
+            gw_cc = await asyncio.to_thread(check_gateway, gateway)
+            if gw_cc:
+                print(f"[Gateway] OK Connected via "
+                      f"{gateway.get('scheme', 'http').upper()} - egress is in {gw_cc}")
+            else:
+                print("[Gateway] Aborting: no usable tunnel.")
+                await browser.close()
+                return
+
+            print("[Gateway] Checking destination policy...")
+            blocked = await asyncio.to_thread(check_destinations, gateway)
+            if blocked:
+                print("[Gateway] Aborting: gateway refuses a required host:")
+                for target, _verdict, detail in blocked:
+                    print(f"[Gateway]      {target} -> {detail}")
+                await browser.close()
+                return
+
+        proxy_pool = None
+
+        if ip_mode == "lists":
+            print("\n[Proxy] Initializing free-list pool (cache first)...")
+            cached = load_proxy_cache()
+            if cached:
+                proxy_pool = ProxyPool(cached)
+                print(f"[Proxy] pool seeded from cache: {proxy_pool.size()}")
+            else:
+                print("[Proxy] no fresh cache - seeding from sources...")
+                initial = await fetch_and_validate_proxies(PROXY_POOL_SIZE)
+                proxy_pool = ProxyPool(initial)
+                if initial:
+                    save_proxy_cache(initial)
+                print(f"[Proxy] pool seeded: {proxy_pool.size()}")
+            if proxy_pool.size() == 0:
+                print("[Proxy] no working proxies at startup.")
+
+        elif ip_mode == "file":
+            print(f"\n[Proxy] Loading {PROXY_FILE}...")
+            raw = load_proxies_file()
+            if not raw:
+                print(f"[Proxy] {PROXY_FILE} is missing or empty. "
+                      f"Put one proxy per line, e.g. ip:port:user:pass")
+                await browser.close()
+                return
+
+            if FILE_PROXY_DETECT_COUNTRY:
+                detected = await detect_file_proxy_countries(raw)
+                entries = []
+                for server, user, pw, cc in detected:
+                    entries.append((server, user, pw, cc or FILE_PROXY_DEFAULT_CC))
+            else:
+                entries = [(server, user, pw, FILE_PROXY_DEFAULT_CC)
+                           for server, user, pw in raw]
+                print(f"[Proxy] using default country {FILE_PROXY_DEFAULT_CC} "
+                      f"for timezone (set FILE_PROXY_DETECT_COUNTRY=True "
+                      f"to probe)")
+
+            proxy_pool = FileProxyPool(entries)
+            print(f"[Proxy] file pool ready: {proxy_pool.total()} proxies")
+
+        async def fresh_proxy_provider():
+            if ip_mode == "gateway":
+                try:
+                    gw_proxy, cc = await asyncio.to_thread(make_gateway_proxy, gateway)
+                except Exception as e:
+                    print(f"[net] gateway fresh-proxy failed: {e}")
+                    return None
+                srv = gw_proxy["server"]
+                auth = (gw_proxy["username"], gw_proxy["password"])
+                ok = await asyncio.to_thread(preflight_proxy, srv, auth,
+                                             "tokboostly.com:443", 6)
+                if not ok:
+                    print(f"[net] gateway preflight failed for {srv}")
+                    return None
+                ig = proxy_dict_for_ig(srv, auth)
+                return srv, auth, cc, ig
+
+            if ip_mode in ("lists", "file"):
+                for _ in range(8):
+                    entry = proxy_pool.take()
+                    if entry is None:
+                        entry = await proxy_pool.wait_for_one()
+                    if entry is None:
+                        return None
+                    if ip_mode == "lists":
+                        srv, cc_code = entry
+                        auth = None
+                        cc = (country_label_for(cc_code), cc_code) if cc_code else None
+                    else:
+                        srv, user, pw, cc_code = entry
+                        auth = (user, pw) if user else None
+                        cc = (country_label_for(cc_code), cc_code)
+                    ok = await asyncio.to_thread(preflight_proxy, srv, auth,
+                                                 "tokboostly.com:443", 6)
+                    if ok:
+                        ig = proxy_dict_for_ig(srv, auth)
+                        return srv, auth, cc, ig
+                    try:
+                        proxy_pool.blacklist(srv)
+                    except Exception:
+                        pass
+                print("[net] no preflight-passing proxy left for resurrection")
+                return None
+
+            return None
+
+        created = 0
+        attempt = 0
+        consecutive_failures = 0
+        by_country = {}
+        bw_totals = {"wire": 0, "saved": 0, "attempts": 0}
+        interrupted = False
+        unlimited = (target_accounts == 0)
+
+        if SAVE_BANDWIDTH:
+            cached_bw = len([f for f in os.listdir(ASSET_CACHE_DIR)
+                             if f.endswith(".bin")]) if os.path.isdir(ASSET_CACHE_DIR) else 0
+            print(f"[bw] Saver on: {cached_bw} cached bundle(s).")
+            if os.path.isfile(os.path.join(BASE_DIR, INSTA_POOL_FILE)):
+                try:
+                    with open(os.path.join(BASE_DIR, INSTA_POOL_FILE)) as f:
+                        n = len([ln for ln in f if ln.strip() and not ln.startswith("#")])
+                    print(f"[insta] {INSTA_POOL_FILE}: {n} rotation handle(s) queued.")
+                except OSError:
+                    pass
+            used_count = len(_load_used_handles())
+            if used_count:
+                print(f"[insta] {USED_INSTA_FILE}: {used_count} rotation handle(s) "
+                      f"already used (will be skipped).")
+
+        if unlimited and LOOP_DELAY_SECS > 0:
+            print(f"[loop] unlimited mode: {LOOP_DELAY_SECS}s delay between accounts")
+        elif unlimited:
+            print("[loop] unlimited mode: no delay between accounts")
+
+        while True:
+            if target_accounts and created >= target_accounts:
+                break
+            attempt += 1
+            target_label = f"{created + 1}/{target_accounts}" if target_accounts else f"{created + 1} (unlimited)"
+            print(f"\n{'='*50}")
+            print(f"> Account {target_label} | attempt {attempt}")
+            print(f"{'='*50}")
+
+            proxy_server = None
+            proxy_auth = None
+            country = None
+
+            try:
+                if ip_mode == "gateway":
+                    gw_proxy, country = await asyncio.to_thread(make_gateway_proxy, gateway)
+                    proxy_server = gw_proxy["server"]
+                    proxy_auth = (gw_proxy["username"], gw_proxy["password"])
+                    print(f"[Gateway] {proxy_server} | country={country[0]} | fresh session")
+
+                elif ip_mode == "lists":
+                    entry = proxy_pool.take()
+                    if entry is None:
+                        print(f"[Proxy] pool empty - waiting for refill...")
+                        entry = await proxy_pool.wait_for_one()
+                    if entry:
+                        proxy_server, cc = entry
+                        if cc:
+                            country = (country_label_for(cc), cc)
+                        print(f"[Proxy] Using {proxy_server} "
+                              f"(pool has {proxy_pool.size()} left)")
+                    else:
+                        print("[Proxy] no working proxies - running direct.")
+                    proxy_pool.maybe_refill(PROXY_LOW_WATER, PROXY_POOL_SIZE)
+
+                elif ip_mode == "file":
+                    entry = proxy_pool.take()
+                    if entry:
+                        server, user, pw, cc = entry
+                        proxy_server = server
+                        proxy_auth = (user, pw) if user else None
+                        country = (country_label_for(cc), cc)
+                        label = f"{server} ({cc})"
+                        if user:
+                            label = f"{server} ({cc}, auth)"
+                        print(f"[Proxy] Using {label} | "
+                              f"file pool has {proxy_pool.size()}/{proxy_pool.total()} left")
+                    else:
+                        print("[Proxy] file pool empty - running direct.")
+
+                else:
+                    print("[IP] Using your own connection (direct).")
+
+                ig_proxies = proxy_dict_for_ig(proxy_server, proxy_auth)
+
+                email = await get_email_from_gocaria()
+                password = generate_password_from_email(email)
+
+                print(f"[Prep] Email:    {email}")
+                print(f"[Prep] Password: {password}")
+
+                await run_tokboostly_account(
+                    email, password, ig_proxies, browser,
+                    proxy_server, country, proxy_auth, bw_totals,
+                    get_fresh_proxy=fresh_proxy_provider)
+
+                created += 1
+                consecutive_failures = 0
+                cc_key = country[1] if country else ("unknown" if ip_mode in ("lists", "file") else "direct")
+                tally = by_country.setdefault(cc_key, [0, 0])
+                tally[0] += 1
+                print(f"\nAccount done! Total this run: {created}" +
+                      (f"/{target_accounts}" if target_accounts else ""))
+
+                if unlimited and LOOP_DELAY_SECS > 0:
+                    print(f"[loop] cooling down {LOOP_DELAY_SECS}s "
+                          f"before next account...")
+                    try:
+                        await countdown_sleep(LOOP_DELAY_SECS, label="loop")
+                    except (KeyboardInterrupt, asyncio.CancelledError):
+                        interrupted = True
+                        print("\nInterrupted during loop delay.")
+                        break
+
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                interrupted = True
+                print("\nInterrupted.")
+                break
+
+            except ProxyDead as e:
+                print(f"[Proxy] dead tunnel: {e}")
+                if proxy_pool is not None and proxy_server:
+                    try:
+                        proxy_pool.blacklist(proxy_server)
+                    except Exception:
+                        pass
+                if not await _sleep_or_stop(2):
+                    interrupted = True
+                    break
+                attempt -= 1
+
+            except Exception as e:
+                consecutive_failures += 1
+                print(f"Attempt failed: {e}")
+                cc_key = country[1] if country else ("unknown" if ip_mode in ("lists", "file") else "direct")
+                tally = by_country.setdefault(cc_key, [0, 0])
+                tally[1] += 1
+                if consecutive_failures >= 10:
+                    print("10 consecutive failures - stopping.")
+                    break
+                wait_time = min(10 * consecutive_failures, 60)
+                print(f"Waiting {wait_time}s before retry...")
+                if not await _sleep_or_stop(wait_time):
+                    interrupted = True
+                    print("\nInterrupted during backoff.")
+                    break
+
+        if proxy_pool is not None:
+            try:
+                await proxy_pool.aclose()
+            except Exception:
+                pass
+
+        print(f"\n{'='*50}")
+        print("DONE (interrupted)." if interrupted else "DONE.")
+        print(f"   {created} account(s) created this run.")
+        if len(by_country) > 1 or any(v[1] for v in by_country.values()):
+            print("Per-region outcome (ok / failed):")
+            for cc, (good, bad) in sorted(by_country.items(),
+                                          key=lambda kv: -(kv[1][0] + kv[1][1])):
+                print(f"     {cc:<8} {good} ok / {bad} failed")
+        if bw_totals["attempts"]:
+            total_mb = bw_totals["wire"] / 1048576
+            per = total_mb / bw_totals["attempts"]
+            print(f"Proxy traffic: {total_mb:.1f} MB across {bw_totals['attempts']} "
+                  f"attempt(s) = {per:.2f} MB each")
+            if per > 0:
+                print(f"~{100 / per:.0f} attempt(s) per 100 MB of quota.")
+        print(f"{'='*50}")
+        await _shutdown(browser)
+
+
+if __name__ == "__main__":
+    print("TokBoostly Auto-Registration (async Playwright + stealth)")
+    print("=" * 50)
+    print(f"Writing accounts.txt to: {BASE_DIR}")
+
+    check_jmk_pending_at_startup()
+
+    if CLOUD_MODE:
+        ip_mode = "gateway"
+        target_accounts = CLOUD_TARGET_ACCOUNTS
+        user = CLOUD_GATEWAY_USER.strip()
+        pw = CLOUD_GATEWAY_PASS.strip()
+        if user.startswith("user-"):
+            user = user[5:]
+        gateway = {
+            "host": CLOUD_GATEWAY_HOST,
+            "port": CLOUD_GATEWAY_PORT,
+            "user": user,
+            "pass": pw,
+            "provider": "decodo",
+        }
+        print("\nCLOUD MODE")
+        print(f"   gateway : {gateway['host']}:{gateway['port']} "
+              f"(decodo, US, session-rotated)")
+        print(f"   user    : {gateway['user']}")
+        print(f"   headless: {HEADLESS}")
+        print(f"   target  : {'unlimited' if target_accounts == 0 else target_accounts}")
+    else:
+        try:
+            ip_mode, target_accounts, gateway = prompt_options()
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled at setup.")
+            raise SystemExit(0)
+
+    if ip_mode == "gateway" and gateway:
+        mode_label = f"{gateway.get('provider', 'custom')} gateway ({gateway['host']}:{gateway['port']})"
+    elif ip_mode == "direct":
+        mode_label = "my own IP (direct)"
+    elif ip_mode == "file":
+        mode_label = f"proxies.txt (static file: {PROXY_FILE})"
+    else:
+        mode_label = "free proxy lists (pool, background refill)"
+    target = str(target_accounts) if target_accounts else "unlimited"
+    print(f"\nMode: {mode_label} | Target: {target} account(s)\n")
+    try:
+        asyncio.run(main_flow(ip_mode, target_accounts, gateway))
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\nStopped by Ctrl+C. accounts.txt is safe.")
+        raise SystemExit(130)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print("\nCrashed - traceback above.")
