@@ -1,20 +1,13 @@
 FROM mcr.microsoft.com/playwright/python:v1.52.0-noble
 
-WORKDIR /app
+RUN apt-get update && apt-get install -y xvfb
 
-# system deps that the playwright base already has: skip apt-get entirely.
-# just install our python deps.
+WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-
 COPY . .
 
-# The playwright base image already sets PLAYWRIGHT_BROWSERS_PATH and has
-# chromium + ffmpeg pre-baked, so no `playwright install` step is needed.
-# That saves ~30s per cold build and ~400 MB in the layer cache.
-
-# Stream stdout so Railway's log pane shows our prints live.
 ENV PYTHONUNBUFFERED=1
-ENV RENWE_HEADLESS=1
+# NOT setting RENWE_HEADLESS — leave it unset so cloud mode does not force it
 
-CMD ["python", "-u", "renwe.py"]
+CMD ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", "python", "-u", "renwe.py"]
