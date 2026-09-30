@@ -80,9 +80,6 @@ ORDERS_REFRESH_TRIES = 3
 ORDERS_REFRESH_GAP   = 5
 
 # ========== LOOP DELAY (unlimited mode only) ==========
-# After every successful account in unlimited mode, wait this many seconds
-# before starting the next account. 0 = no delay. Has no effect when the
-# run is capped at a specific number of accounts.
 LOOP_DELAY_SECS = 420
 
 TARGET_HANDLE       = "jmk_tg._"
@@ -2854,6 +2851,22 @@ async def main_flow(ip_mode="gateway", target_accounts=1, gateway=None):
 
 
 if __name__ == "__main__":
+    # --- TEMP DEBUG: what env does the container actually see? ---
+    import sys as _sys
+    print("=" * 50)
+    print("[DEBUG] RENWE_GATEWAY_USER set? ",
+          bool(os.environ.get("RENWE_GATEWAY_USER", "").strip()))
+    print("[DEBUG] RENWE_GATEWAY_USER value: ",
+          repr(os.environ.get("RENWE_GATEWAY_USER", "")))
+    print("[DEBUG] RENWE_GATEWAY_PASS set? ",
+          bool(os.environ.get("RENWE_GATEWAY_PASS", "").strip()))
+    print("[DEBUG] CLOUD_MODE module const: ", CLOUD_MODE)
+    print("[DEBUG] HEADLESS module const:   ", HEADLESS)
+    print("[DEBUG] python: ", _sys.version.split()[0])
+    print("[DEBUG] file:   ", __file__)
+    print("=" * 50)
+    # --- END TEMP DEBUG ---
+
     print("🚀 TokBoostly Auto-Registration (async Playwright + stealth)")
     print("=" * 50)
     print(f"📁 Writing accounts.txt to: {BASE_DIR}")
