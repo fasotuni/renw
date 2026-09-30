@@ -1243,31 +1243,43 @@ async def _fill_ig_modal_and_save(page, handle, timeout=12000):
         except Exception: pass
         return False
 
-# ========== CF CLEARANCE HARVEST ==========
-# curl_cffi passes CF where the Playwright browser doesn't. But we can't run
-# the whole flow through curl_cffi (way too much reverse engineering). So:
-# harvest the cf_clearance cookie via curl_cffi's impersonation, inject it
-# into the browser, align the browser's UA to the impersonation target so
-# the cookie is valid, and let the BROWSER drive the register POST. React
-# sees the response, advances to the OTP step, and we continue natively.
-async def harvest_cf_clearance(proxy_server, proxy_auth):
+# ========== CURL_CFFI REGISTER + COOKIE HANDOFF ==========
+# The register POST goes through curl_cffi because Cloudflare lets its TLS
+# fingerprint through and blocks the browser's. But when curl_cffi does the
+# register, React in the browser never sees the response and stays on step 3.
+# Fix: run the register via curl_cffi, capture every Set-Cookie the server
+# returns, inject them into the browser context, then reload /signup/. The
+# app sees its own signup-in-progress cookies on load and jumps straight to
+# the OTP entry screen.
+
+async def curl_cffi_register(email, full_name, password, proxy_server, proxy_auth):
     if not HAS_CURL_CFFI:
+        print("[cf-register] curl_cffi not installed")
         return None
     proxy_url = proxy_url_with_auth(proxy_server, proxy_auth)
     proxies_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
+    payload = {
+        "fullName": full_name,
+        "email": email,
+        "password": password,
+        "visitor_id": f"v_{''.join(random.choices('0123456789abcdef', k=32))}",
+    }
 
     for target, ua_version in CURL_IMPERSONATE_CANDIDATES:
         try:
             session = cffi_requests.Session(impersonate=target)
         except Exception as e:
-            print(f"[cf] {target}: unsupported ({str(e)[:60]})")
+            print(f"[cf-register] {target}: unsupported ({str(e)[:60]})")
             continue
         ua = (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               f"AppleWebKit/537.36 (KHTML, like Gecko) "
               f"Chrome/{ua_version} Safari/537.36")
+
+        # warm up with a GET so we get a session cookie first
         try:
-            print(f"[cf] {target}: warm-up GET /signup/")
-            r = await asyncio.to_thread(
+            print(f"[cf-register] {target}: warm-up GET /signup/")
+            r0 = await asyncio.to_thread(
                 session.get, TOKBOOSTLY_URL,
                 headers={"User-Agent": ua,
                          "Accept": "text/html,application/xhtml+xml,"
@@ -1277,44 +1289,80 @@ async def harvest_cf_clearance(proxy_server, proxy_auth):
                 proxies=proxies_dict, timeout=30,
             )
         except Exception as e:
-            print(f"[cf] {target}: warm-up error {str(e)[:120]}")
+            print(f"[cf-register] {target}: warm-up error {str(e)[:100]}")
             continue
-        if "just a moment" in (r.text or "").lower():
-            print(f"[cf] {target}: warm-up returned CF challenge")
+        if r0.status_code >= 400 or "just a moment" in (r0.text or "").lower():
+            print(f"[cf-register] {target}: warm-up not clean "
+                  f"(status={r0.status_code})")
             continue
-        if r.status_code >= 400:
-            print(f"[cf] {target}: warm-up HTTP {r.status_code}")
+        print(f"[cf-register] {target}: warm-up OK ({len(r0.text)}B)")
+
+        # the actual register POST
+        try:
+            print(f"[cf-register] {target}: POST /api/auth/register")
+            resp = await asyncio.to_thread(
+                session.post,
+                "https://tokboostly.com/api/auth/register",
+                json=payload,
+                headers={"User-Agent": ua,
+                         "Accept": "application/json, text/plain, */*",
+                         "Accept-Language": "en-US,en;q=0.9",
+                         "Content-Type": "application/json",
+                         "Origin": "https://tokboostly.com",
+                         "Referer": "https://tokboostly.com/signup/"},
+                proxies=proxies_dict, timeout=30,
+            )
+        except Exception as e:
+            print(f"[cf-register] {target}: POST error {str(e)[:100]}")
             continue
-        cf_val = None
+
+        body = resp.text or ""
+        print(f"[cf-register] {target}: register status={resp.status_code}")
+        if "just a moment" in body.lower():
+            print(f"[cf-register] {target}: still CF-challenged")
+            continue
+        if resp.status_code not in (200, 201):
+            print(f"[cf-register] {target}: body: {body[:300]!r}")
+            continue
+
+        # harvest every cookie curl_cffi got back so we can replay them
+        # in the browser
+        cookies = []
         try:
             for c in session.cookies.jar:
-                if c.name == "cf_clearance":
-                    cf_val = c.value
-                    break
+                cookies.append({
+                    "name": c.name,
+                    "value": c.value,
+                    "domain": c.domain or "tokboostly.com",
+                    "path": c.path or "/",
+                })
         except Exception:
             pass
-        if not cf_val:
-            print(f"[cf] {target}: no cf_clearance issued")
-            continue
-        print(f"[cf] {target}: cf_clearance harvested ({cf_val[:24]}...)")
-        return {"cf_clearance": cf_val, "ua": ua,
-                "ua_version": ua_version, "impersonate": target}
-    print("[cf] no cf_clearance could be harvested")
+        print(f"[cf-register] {target}: register OK, "
+              f"harvested {len(cookies)} cookie(s)")
+        return {"status": resp.status_code, "body": body,
+                "cookies": cookies, "target": target, "ua": ua,
+                "ua_version": ua_version}
+
+    print("[cf-register] every impersonation target failed")
     return None
 
 async def run_tokboostly_account(email, password, ig_proxies, browser,
                                  proxy_server=None, country=None,
                                  proxy_auth=None, bw_totals=None,
                                  get_fresh_proxy=None):
-    # ---- HARVEST cf_clearance BEFORE building the context, so we can align
-    #      the browser's UA to whatever curl_cffi impersonated.
-    cf = await harvest_cf_clearance(proxy_server, proxy_auth)
-    browser_ua = ACTUAL_UA
-    browser_chromium_ver = ACTUAL_CHROMIUM_VERSION
-    if cf:
-        # align browser to the impersonated version so cf_clearance is valid
-        browser_ua = cf["ua"]
-        browser_chromium_ver = cf["ua_version"].split(".")[0]
+    # ---- [A] register via curl_cffi FIRST, before opening the browser.
+    # We don't yet know the name that will be submitted, so generate it here
+    # and reuse it in the browser to keep the flow visually consistent.
+    full_name = random_person_name()
+    print(f"[A] Registering via curl_cffi (full name: {full_name})...")
+    reg = await curl_cffi_register(email, full_name, password,
+                                   proxy_server, proxy_auth)
+    if not reg:
+        raise Exception("curl_cffi register failed on every target")
+
+    browser_ua = reg["ua"]
+    browser_ver = reg["ua_version"].split(".")[0]
 
     context_kwargs = dict(
         viewport={"width":1366,"height":768},
@@ -1323,9 +1371,9 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         timezone_id=timezone_for(country[1]) if country else "America/New_York",
         extra_http_headers={
             "Accept-Language": "en-US,en;q=0.9",
-            "sec-ch-ua": f'"Chromium";v="{browser_chromium_ver}", '
+            "sec-ch-ua": f'"Chromium";v="{browser_ver}", '
                          f'"Not_A Brand";v="24", '
-                         f'"Google Chrome";v="{browser_chromium_ver}"',
+                         f'"Google Chrome";v="{browser_ver}"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"Windows"',
             "sec-ch-ua-platform-version": '"10.0.0"',
@@ -1346,21 +1394,14 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
 
     context = await browser.new_context(**context_kwargs)
 
-    # inject cf_clearance into the browser's jar
-    if cf:
+    # inject every cookie curl_cffi's session collected
+    if reg["cookies"]:
         try:
-            await context.add_cookies([{
-                "name": "cf_clearance",
-                "value": cf["cf_clearance"],
-                "domain": ".tokboostly.com",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "None",
-            }])
-            print(f"[cf] injected cf_clearance into browser jar")
+            await context.add_cookies(reg["cookies"])
+            names = [c["name"] for c in reg["cookies"]]
+            print(f"[A] injected {len(reg['cookies'])} cookie(s): {names}")
         except Exception as e:
-            print(f"[cf] could not inject cookie: {e}")
+            print(f"[A] could not inject cookies: {e}")
 
     page = await context.new_page()
     install_response_capture(page)
@@ -1408,104 +1449,54 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         return True
 
     try:
-        # ---- [0] signup page ----
-        print("\n[0] Opening TokBoostly signup...")
+        # ---- [B] load signup with cookies, jump into OTP step ----
+        print("\n[B] Opening TokBoostly signup (cookies pre-injected)...")
         try:
             await goto_with_retry(page, TOKBOOSTLY_URL,
-                                  tries=GOTO_RETRIES, wait=GOTO_RETRY_WAIT, label="0")
+                                  tries=GOTO_RETRIES, wait=GOTO_RETRY_WAIT, label="B")
         except ProxyDead:
             if await _resurrect():
                 await goto_with_retry(page, TOKBOOSTLY_URL,
-                                      tries=2, wait=GOTO_RETRY_WAIT, label="0")
+                                      tries=2, wait=GOTO_RETRY_WAIT, label="B")
             else: raise
-        await page.wait_for_selector(
-            "button:has-text('Continue with email'), "
-            "button:has-text('Continue with GitHub')", timeout=30000)
         await asyncio.sleep(3)
 
-        # ---- [1] Continue with email ----
-        print("[1] Clicking 'Continue with email'...")
-        if not await _click_and_log(page, [
-            "button:has-text('Continue with email')",
-            "button:has-text('Continue with Email')",
-        ], "1-continue", timeout=15000):
-            raise Exception("'Continue with email' button not found or not clickable")
-        await asyncio.sleep(random.uniform(2, 3.5))
+        # The app should see its own signup-in-progress state from the
+        # cookies. It may already render the OTP step, or it might still
+        # show step 3. If step 3, click Continue on the resume path:
+        # check if "Back to sign-up options" or an OTP input is already there.
+        resumed = False
+        try:
+            otp_already = await wait_first(page, [
+                "input[inputmode='numeric']",
+                "input[autocomplete='one-time-code']",
+                "input[name='otp']",
+                "input[name='code']",
+            ], timeout=6000)
+            if otp_already:
+                print(f"[B] app already showing OTP input: {otp_already}")
+                resumed = True
+        except PlaywrightTimeoutError:
+            pass
 
-        # ---- [2] name ----
-        print("[2] Filling name field...")
-        full_name = random_person_name()
-        await fill_first(page, ["#signup-step-name",
-                                "input[autocomplete='name']",
-                                "input[placeholder='Jane Creator']"],
-                         full_name, timeout=15000)
-        await asyncio.sleep(random.uniform(0.4, 0.9))
-        print(f"[2] Name: {full_name}")
-        await _fire_validation(page, ["#signup-step-name"])
-        await asyncio.sleep(0.6)
-        await _click_and_log(page, ["button:text-is('Continue')"],
-                             "2-continue", timeout=6000)
-        await asyncio.sleep(random.uniform(1.5, 3))
+        if not resumed:
+            # try the full flow again but skip create-account (already done)
+            # the app may expose a "resend" or "verify" link; look for it
+            print("[B] app shows signup form, looking for resume links...")
+            resume = await click_any(page, [
+                "a:has-text('Verify')",
+                "a:has-text('verify')",
+                "button:has-text('Verify')",
+                "a:has-text('Enter code')",
+                "a:has-text('I have a code')",
+                "a:has-text('Already have a code')",
+            ], timeout=4000)
+            if resume:
+                print(f"[B] clicked resume link: {resume}")
+                await asyncio.sleep(2)
 
-        # ---- [3] email ----
-        print("[3] Filling email...")
-        await fill_first(page, ["#signup-step-email",
-                                "input[autocomplete='email']",
-                                "input[type='email']"],
-                         email, timeout=15000)
-        await asyncio.sleep(random.uniform(0.4, 0.9))
-        await _fire_validation(page, ["#signup-step-email"])
-        await asyncio.sleep(0.6)
-        await _click_and_log(page, ["button:text-is('Continue')"],
-                             "3-continue", timeout=6000)
-        await asyncio.sleep(random.uniform(1.5, 3))
-
-        # ---- [4] password x2, click Create account in the browser ----
-        print("[4] Filling password x2...")
-        await fill_first(page, ["#signup-step-password",
-                                "input[autocomplete='new-password']"],
-                         password, timeout=15000)
-        await asyncio.sleep(random.uniform(0.4, 0.9))
-        await fill_first(page, ["#signup-step-confirm",
-                                "input[autocomplete='new-password'][type='password']"],
-                         password, timeout=15000)
-        await asyncio.sleep(random.uniform(0.4, 0.9))
-        await _fire_validation(page, ["#signup-step-password", "#signup-step-confirm"])
-        await asyncio.sleep(0.8)
-
-        print("[4] Clicking 'Create account' (browser, with cf_clearance)...")
-        await _click_and_log(page, ["button:text-is('Create account')",
-                                     "button:has-text('Create account')"],
-                             "4-create", timeout=12000)
-
-        # ---- [4.5] after-create diagnostic ----
-        await asyncio.sleep(4)
-        try: body_pre = (await page.text_content("body")) or ""
-        except Exception: body_pre = ""
-        print(f"[4.5] url after create: {page.url}")
-        form_still = await page.query_selector("#signup-step-password")
-        if form_still:
-            print("[4.5] signup form STILL present")
-
-        for _probe in range(3):
-            try:
-                cap = await page.query_selector(
-                    "[data-sitekey], iframe[src*='captcha'], iframe[src*='hcaptcha'], "
-                    "iframe[src*='turnstile']")
-                if cap:
-                    if CLOUD_MODE:
-                        raise Exception("captcha shown in headless cloud mode")
-                    print("[4] Captcha - solve it manually in the browser.")
-                    await relax_bandwidth_saver(context)
-                    await asyncio.to_thread(input, "Press Enter after solving...")
-                    break
-            except Exception as probe_err:
-                if CLOUD_MODE and "captcha shown in headless" in str(probe_err):
-                    raise
-            await asyncio.sleep(2)
-
-        # ---- [5] email verification code ----
-        print("[5] Waiting for verification code prompt...")
+        # ---- [C] email verification code ----
+        print("[C] Waiting for verification code prompt...")
         code_sels = [
             "input[inputmode='numeric'][placeholder*='6']",
             "input[placeholder*='6-digit']",
@@ -1520,18 +1511,18 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         code_sel = None
         try:
             code_sel = await wait_first(page, code_sels, timeout=30000)
-            print(f"[5] code input matched: {code_sel}")
+            print(f"[C] code input matched: {code_sel}")
         except PlaywrightTimeoutError:
             if TOKBOOSTLY_HOST in page.url and "/dashboard" in page.url:
-                print("[5] No code prompt - already on dashboard.")
+                print("[C] already on dashboard - skipping OTP")
             else:
-                print("[5] FAILED to find code input - dumping state:")
-                await dump_page_state(page, tag="5-fail")
+                print("[C] FAILED - dumping state")
+                await dump_page_state(page, tag="C-fail")
                 raise
 
         if code_sel:
             signup_t0 = time.time()
-            print("[5] Fetching code from gocaria inbox...")
+            print("[C] Fetching code from gocaria inbox...")
             otp_ctx = await browser.new_context()
             await install_bandwidth_saver(otp_ctx)
             otp_page = await otp_ctx.new_page()
@@ -1560,7 +1551,7 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
                     except Exception: break
             await asyncio.sleep(0.8)
 
-            print("[5] Clicking 'Verify email'...")
+            print("[C] Clicking 'Verify email'...")
             verify_btn_sels = ["button:text-is('Verify email')",
                                "button:text-is('Verify')",
                                "button:has-text('Verify email')"]
@@ -1568,16 +1559,16 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             print(f"[DIAG] clicked selector: {clicked_label}")
             await asyncio.sleep(random.uniform(2.5, 4))
 
-        print("[5] Waiting for dashboard...")
+        print("[C] Waiting for dashboard...")
         deadline = time.time() + 45
         while time.time() < deadline:
             if TOKBOOSTLY_HOST in page.url and "/dashboard" in page.url: break
             await asyncio.sleep(1)
         else:
-            print(f"[5] never reached dashboard. url={page.url}")
-            await dump_page_state(page, tag="5-timeout")
+            print(f"[C] never reached dashboard. url={page.url}")
+            await dump_page_state(page, tag="C-timeout")
             raise Exception(f"Never reached dashboard (still at {page.url})")
-        print(f"[5] On dashboard: {page.url}")
+        print(f"[C] On dashboard: {page.url}")
 
         if SAVE_BANDWIDTH:
             try: await page.evaluate("window.stop()")
