@@ -60,8 +60,6 @@ CURL_IMPERSONATE_CANDIDATES = [
     ("chrome123", "123.0.0.0"),
 ]
 
-# Verify-email endpoint candidates. curl_cffi will try each until one returns
-# 200 with a non-challenge body.
 VERIFY_ENDPOINT_CANDIDATES = [
     "/api/auth/verify-email",
     "/api/auth/verify",
@@ -1256,7 +1254,11 @@ async def _fill_ig_modal_and_save(page, handle, timeout=12000):
         return False
 
 # ========== CURL_CFFI REGISTER + VERIFY ==========
-async def _cffi_session(proxy_server, proxy_auth, target):
+# NOTE: _cffi_session is a PLAIN SYNC function. It used to be async which
+# caused "cannot unpack non-iterable coroutine object" because to_thread
+# wrapped a coroutine that was never awaited.
+
+def _cffi_session(proxy_server, proxy_auth, target):
     proxy_url = proxy_url_with_auth(proxy_server, proxy_auth)
     proxies_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     try:
@@ -1291,8 +1293,7 @@ async def cffi_register(email, full_name, password, proxy_server, proxy_auth):
         "visitor_id": f"v_{''.join(random.choices('0123456789abcdef', k=32))}",
     }
     for target, ua_version in CURL_IMPERSONATE_CANDIDATES:
-        session, proxies_dict, err = await asyncio.to_thread(
-            _cffi_session, proxy_server, proxy_auth, target)
+        session, proxies_dict, err = _cffi_session(proxy_server, proxy_auth, target)
         if err:
             print(f"[cf-register] {err}"); continue
         ua = _ua_for(ua_version)
@@ -1344,17 +1345,13 @@ async def cffi_register(email, full_name, password, proxy_server, proxy_auth):
     return None
 
 async def cffi_verify_email(reg, email, otp):
-    """Try every plausible verify endpoint with the SAME curl_cffi session
-    that registered, and report which one returns 200."""
     session = reg.get("session")
     proxies_dict = reg.get("proxies")
     ua = reg["ua"]
     if not session:
-        print("[cf-verify] no session in reg result"); return None
-
+        print("[cf-verify] no session"); return None
     for ep in VERIFY_ENDPOINT_CANDIDATES:
         url = f"https://tokboostly.com{ep}"
-        # try both {email, code} and {email, otp} and {code} shapes
         for payload in (
             {"email": email, "code": otp},
             {"email": email, "otp": otp},
@@ -1381,8 +1378,8 @@ async def cffi_verify_email(reg, email, otp):
                 print(f"[cf-verify] OK {status} on {tag}")
                 print(f"[cf-verify] body: {body!r}")
                 cookies = _collect_cookies(session)
-                names = [c["name"] for c in cookies]
-                print(f"[cf-verify] cookies after verify: {names}")
+                print(f"[cf-verify] cookies after verify: "
+                      f"{[c['name'] for c in cookies]}")
                 return {"status": status, "body": r.text, "cookies": cookies}
             if status != 404 and status != 400:
                 print(f"[cf-verify] {status} on {tag} body={body!r}")
@@ -1393,14 +1390,12 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
                                  proxy_server=None, country=None,
                                  proxy_auth=None, bw_totals=None,
                                  get_fresh_proxy=None):
-    # ---- [A] register via curl_cffi
     full_name = random_person_name()
     print(f"[A] Registering via curl_cffi (name={full_name})...")
     reg = await cffi_register(email, full_name, password, proxy_server, proxy_auth)
     if not reg:
         raise Exception("register failed on all targets")
 
-    # ---- [A2] fetch OTP from gocaria, then verify via curl_cffi
     print("[A2] Fetching OTP from gocaria inbox...")
     otp_ctx = await browser.new_context()
     await install_bandwidth_saver(otp_ctx)
@@ -1417,11 +1412,9 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
     print("[A3] Verifying email via curl_cffi...")
     vres = await cffi_verify_email(reg, email, otp)
 
-    # use the freshest cookie set (post-verify if available, else post-register)
     final_cookies = (vres["cookies"] if vres else reg["cookies"])
     print(f"[A3] final cookies: {[c['name'] for c in final_cookies]}")
 
-    # ---- [B] build browser with those cookies + matching UA ----
     browser_ver = reg["ua_version"].split(".")[0]
     context_kwargs = dict(
         viewport={"width":1366,"height":768},
@@ -1504,8 +1497,7 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         return True
 
     try:
-        # ---- [B] go to dashboard directly (already authenticated) ----
-        print("\n[B] Navigating to /dashboard/ (should be authed)...")
+        print("\n[B] Navigating to /dashboard/...")
         try:
             await goto_with_retry(page, "https://tokboostly.com/dashboard/",
                                   tries=GOTO_RETRIES, wait=GOTO_RETRY_WAIT, label="B")
@@ -1517,18 +1509,16 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         await asyncio.sleep(3)
         print(f"[B] url now: {page.url}")
 
-        # if we landed on /dashboard, great. if not (e.g. bounced to /signup or /login),
-        # retry by signing in via password
         if "/dashboard" not in page.url:
-            print(f"[B] not on dashboard. url={page.url}")
-            # try clicking Sign in link and using the credentials
+            print(f"[B] not on dashboard, trying login. url={page.url}")
             await goto_with_retry(page, "https://tokboostly.com/login/",
                                   tries=2, wait=GOTO_RETRY_WAIT, label="B-login")
             await asyncio.sleep(2)
             await fill_first(page, ["input[type='email']",
                                     "input[autocomplete='email']"], email, timeout=8000)
             await fill_first(page, ["input[type='password']",
-                                    "input[autocomplete='current-password']"], password, timeout=8000)
+                                    "input[autocomplete='current-password']"],
+                             password, timeout=8000)
             await _click_and_log(page, ["button:text-is('Sign in')",
                                          "button:has-text('Sign in')",
                                          "button[type='submit']"], "B-signin", timeout=8000)
@@ -1545,7 +1535,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             except Exception: pass
         await asyncio.sleep(2)
 
-        # ---- [6] Instagram tab -> Connect Instagram -> TARGET_HANDLE ----
         print("[6] Switching to Instagram tab...")
         clicked_tab = await click_any(page, [
             "a[role='tab'][href*='platform=instagram']",
@@ -1590,7 +1579,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
               f"pending entry written to {JMK_PENDING_FILE}")
         await asyncio.sleep(random.uniform(2, 3.5))
 
-        # ---- [7] Grow Followers ----
         print("[7] Clicking 'Gain Followers'...")
         clicked = await click_any(page, [
             "a[href*='instagram-followers']",
@@ -1600,7 +1588,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             raise Exception("Could not find 'Gain Followers' link")
         await asyncio.sleep(random.uniform(2, 4))
 
-        # ---- [8] Checkout ----
         print("[8] Ticking ToS checkbox...")
         try:
             cbs = await page.query_selector_all("input[type='checkbox']")
@@ -1628,7 +1615,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             await click_any(page, ["button:has-text('Place order with wallet')",
                                     "button:text-is('Place order')"], timeout=8000)
 
-        # ---- [9] success ----
         print("[9] Waiting for success message...")
         deadline = time.time() + ORDER_WAIT_SECS
         success = False; order_id = "unknown"
@@ -1644,10 +1630,8 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         if success: print(f"[9] OK Order placed successfully. ID: {order_id}")
         else: print("[9] No explicit success message within window.")
 
-        # ---- [9.5] settle window ----
         settle_t0 = time.time()
-        print(f"[9.5] Settle window: {POST_ORDER_DELAY}s total, "
-              f"Orders-refresh routine up first.")
+        print(f"[9.5] Settle window: {POST_ORDER_DELAY}s total.")
         try:
             print(f"[9.5] Navigating to {TOKBOOSTLY_DASH_IG}")
             try:
@@ -1688,7 +1672,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             except (KeyboardInterrupt, asyncio.CancelledError): raise
         else: print("[9.5] Settle window already elapsed - moving on.")
 
-        # ---- [10] change profile ----
         print(f"[10] Navigating back to {TOKBOOSTLY_DASH_IG}")
         release_handle = None
         rotated = False; last_rot_err = None
