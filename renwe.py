@@ -1,9 +1,6 @@
 """
 renwe.py — TokBoostly auto-registration (async Playwright + stealth)
 Hardcoded cloud mode. DO NOT commit credentials to public repos.
-
-UA is auto-detected from the actual Chromium version at launch time, so the
-wire-level UA string always matches the TLS/JS signals Cloudflare reads.
 """
 
 import asyncio
@@ -35,7 +32,7 @@ TOKBOOSTLY_URL      = "https://tokboostly.com/signup/"
 TOKBOOSTLY_HOST     = "tokboostly.com"
 TOKBOOSTLY_DASH_IG  = "https://tokboostly.com/dashboard/?platform=instagram"
 GOCARIA_URL         = "https://gocaria.my.id"
-HEADLESS            = False
+HEADLESS            = False   # xvfb provides the display in the container
 OTP_TIMEOUT         = 150
 ORDER_WAIT_SECS     = 30
 POST_ORDER_DELAY    = 120
@@ -44,7 +41,6 @@ ORDERS_REFRESH_GAP   = 5
 LOOP_DELAY_SECS = 420
 TARGET_HANDLE       = "jmk_tg._"
 
-# Filled at runtime from browser.version — do not edit manually.
 ACTUAL_UA = None
 ACTUAL_CHROMIUM_VERSION = None
 
@@ -117,7 +113,6 @@ DEXO_PASS = ""
 DEXO_COUNTRY = "US"
 
 def build_ua_from_version(v):
-    """v = '130.0.6723.31' -> full Mozilla UA string matching that Chromium."""
     short = ".".join(v.split(".")[:4]) if v else "0.0.0.0"
     return (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             f"AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -504,6 +499,46 @@ async def goto_with_retry(page, url, tries=GOTO_RETRIES, wait=GOTO_RETRY_WAIT, l
             raise
     raise ProxyDead(f"goto exhausted retries: {str(last_err)[:120]}")
 
+async def dump_page_state(page, tag="state"):
+    """Print title, url, and CF markers currently on the page. Text only,
+    so it shows up in Railway's log pane."""
+    try: title = await page.title()
+    except Exception: title = "(title read failed)"
+    try: url = page.url
+    except Exception: url = "(url read failed)"
+    try:
+        body = (await page.text_content("body")) or ""
+        body_low = body.lower()
+    except Exception:
+        body = ""; body_low = ""
+    cf_hits = []
+    for marker in ("just a moment", "challenges.cloudflare.com",
+                   "cf-challenge", "checking your browser",
+                   "enable javascript", "verify you are human",
+                   "turnstile", "hcaptcha", "recaptcha"):
+        if marker in body_low: cf_hits.append(marker)
+    try:
+        fields = await page.evaluate("""() => {
+            const out = [];
+            document.querySelectorAll('input, button').forEach(el => {
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0) {
+                    out.push(el.tagName.toLowerCase() + ':' +
+                             (el.id || el.name || (el.type || '')) + ':' +
+                             (el.textContent || '').trim().slice(0, 30));
+                }
+            });
+            return out.slice(0, 25);
+        }""")
+    except Exception as e:
+        fields = [f"(evaluate failed: {e})"]
+    print(f"[{tag}] title={title!r}")
+    print(f"[{tag}] url={url}")
+    print(f"[{tag}] cf markers present: {cf_hits}")
+    print(f"[{tag}] visible interactive elements ({len(fields)}):")
+    for f in fields:
+        print(f"[{tag}]    {f}")
+
 def install_response_capture(page):
     async def _handle(response):
         try:
@@ -523,6 +558,10 @@ def install_response_capture(page):
             print(f"[RESP] >>> {method} {status} {url}")
             if req_body: print(f"[RESP]   req-body: {req_body!r}")
             print(f"[RESP]   resp-body: {body[:600]!r}")
+            try:
+                asyncio.get_running_loop().create_task(
+                    dump_page_state(page, tag="dom"))
+            except Exception: pass
         except Exception as e: print(f"[RESP] capture error: {e}")
     def on_response(response):
         try: asyncio.get_running_loop().create_task(_handle(response))
@@ -1230,8 +1269,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         locale="en-US",
         timezone_id=timezone_for(country[1]) if country else "America/New_York",
         extra_http_headers={
-            # Cloudflare reads these; a headless chromium doesn't emit them,
-            # a real Windows Chrome does.
             "Accept-Language": "en-US,en;q=0.9",
             "sec-ch-ua": f'"Chromium";v="{ACTUAL_CHROMIUM_VERSION}", '
                          f'"Not_A Brand";v="24", "Google Chrome";v="{ACTUAL_CHROMIUM_VERSION}"',
@@ -1370,20 +1407,11 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
                                      "button:has-text('Create account')"],
                              "4-create", timeout=12000)
 
-        # ---- [4.5] after-create diagnostic ----
+        # ---- [4.5] diagnostic ----
         await asyncio.sleep(3)
         try: body_pre = (await page.text_content("body")) or ""
         except Exception: body_pre = "(body read failed)"
         print(f"[4.5] url after create: {page.url}")
-        print(f"[4.5] body (first 1200 chars): {body_pre[:1200]!r}")
-        error_markers = ("already registered","email already","invalid email",
-                         "disposable","not allowed","try again","error","failed",
-                         "something went wrong","too many","blocked","forbidden",
-                         "verify your email","verification code","check your email",
-                         "captcha","cloudflare")
-        lower_pre = body_pre.lower()
-        hits = [m for m in error_markers if m in lower_pre]
-        if hits: print(f"[4.5] signals in body: {hits}")
         form_still = await page.query_selector("#signup-step-password")
         if form_still:
             print("[4.5] signup form STILL present - create-account did not advance")
@@ -1426,10 +1454,8 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             if TOKBOOSTLY_HOST in page.url and "/dashboard" in page.url:
                 print("[5] No code prompt - already on dashboard.")
             else:
-                try: body2 = (await page.text_content("body")) or ""
-                except Exception: body2 = "(body read failed)"
-                print(f"[5] FAILED to find code input. url={page.url}")
-                print(f"[5] body (first 1500 chars): {body2[:1500]!r}")
+                print("[5] FAILED to find code input - dumping state:")
+                await dump_page_state(page, tag="5-fail")
                 raise
 
         if code_sel:
@@ -1476,10 +1502,8 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             if TOKBOOSTLY_HOST in page.url and "/dashboard" in page.url: break
             await asyncio.sleep(1)
         else:
-            try: final_body = (await page.text_content("body")) or ""
-            except Exception: final_body = "(body read failed)"
             print(f"[5] never reached dashboard. url={page.url}")
-            print(f"[5] body: {final_body[:1000]!r}")
+            await dump_page_state(page, tag="5-timeout")
             raise Exception(f"Never reached dashboard (still at {page.url})")
         print(f"[5] On dashboard: {page.url}")
 
@@ -1823,8 +1847,7 @@ async def main_flow(ip_mode="gateway", target_accounts=1, gateway=None):
             '--disable-renderer-backgrounding','--disable-ipc-flooding-protection',
             '--disable-features=CalculateNativeWinOcclusion'])
 
-        # ---- auto-detect actual Chromium version and build UA to match ----
-        ACTUAL_CHROMIUM_VERSION = browser.version  # e.g. "130.0.6723.31"
+        ACTUAL_CHROMIUM_VERSION = browser.version
         ACTUAL_UA = build_ua_from_version(ACTUAL_CHROMIUM_VERSION)
         print(f"[ua] chromium version: {ACTUAL_CHROMIUM_VERSION}")
         print(f"[ua] sending UA      : {ACTUAL_UA}")
