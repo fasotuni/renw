@@ -47,8 +47,8 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 # ========== HARDCODED CLOUD CREDENTIALS ==========
 # >>> FILL THESE IN LOCALLY - NEVER COMMIT THEM TO A PUBLIC REPO <<<
-CLOUD_GATEWAY_USER = ""      # decodo username, e.g. "sp12345678"
-CLOUD_GATEWAY_PASS = ""      # decodo password
+CLOUD_GATEWAY_USER = "spoaovgfho"      # decodo username, e.g. "sp12345678"
+CLOUD_GATEWAY_PASS = "3C95VochBi+yxzg4zS"      # decodo password
 CLOUD_GATEWAY_HOST = "gate.decodo.com"
 CLOUD_GATEWAY_PORT = 7000
 CLOUD_TARGET_ACCOUNTS = 0    # 0 = unlimited loop
