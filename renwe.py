@@ -19,8 +19,8 @@ import requests
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ========== HARDCODED CLOUD CREDENTIALS ==========
-CLOUD_GATEWAY_USER = "spoaovgfho"      # decodo username
-CLOUD_GATEWAY_PASS = "3C95VochBi+yxzg4zS"      # decodo password
+CLOUD_GATEWAY_USER = "spoaovgfho"
+CLOUD_GATEWAY_PASS = "3C95VochBi+yxzg4zS"
 CLOUD_GATEWAY_HOST = "gate.decodo.com"
 CLOUD_GATEWAY_PORT = 7000
 CLOUD_TARGET_ACCOUNTS = 0
@@ -489,6 +489,44 @@ async def goto_with_retry(page, url, tries=GOTO_RETRIES, wait=GOTO_RETRY_WAIT, l
                 raise ProxyDead(f"goto failed after {tries} tries: {err[:120]}")
             raise
     raise ProxyDead(f"goto exhausted retries: {str(last_err)[:120]}")
+
+# ========== RESPONSE CAPTURE ==========
+# Log every 4xx/5xx response from tokboostly so we can see the exact
+# server rejection (Supabase auth error, Cloudflare 403, rate-limit, etc.)
+def install_response_capture(page):
+    async def _handle(response):
+        try:
+            url = response.url
+            if TOKBOOSTLY_HOST not in url:
+                return
+            status = response.status
+            if status < 400:
+                return
+            method = response.request.method
+            req_body = ""
+            try:
+                pd = response.request.post_data
+                if pd:
+                    req_body = pd[:400]
+            except Exception:
+                pass
+            body = ""
+            try:
+                body = await response.text()
+            except Exception:
+                body = "(body unreadable)"
+            print(f"[RESP] >>> {method} {status} {url}")
+            if req_body:
+                print(f"[RESP]   req-body: {req_body!r}")
+            print(f"[RESP]   resp-body: {body[:600]!r}")
+        except Exception as e:
+            print(f"[RESP] capture error: {e}")
+    def on_response(response):
+        try:
+            asyncio.get_running_loop().create_task(_handle(response))
+        except Exception:
+            pass
+    page.on("response", on_response)
 
 def new_bandwidth_stats():
     return {"wire":0,"saved":0,"blocked":0,"from_cache":0,"cached_new":0,"local_urls":set()}
@@ -1114,7 +1152,6 @@ async def _force_enable_and_click(page, label_regex):
     except Exception: return False
 
 async def _click_and_log(page, selectors, label, timeout=10000):
-    """click_any + explicit success/failure logging."""
     sel = await click_any(page, selectors, timeout=timeout)
     if sel:
         print(f"[{label}] clicked: {sel}")
@@ -1208,6 +1245,7 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
 
     context = await browser.new_context(**context_kwargs)
     page = await context.new_page()
+    install_response_capture(page)   # <-- logs every 4xx/5xx from tokboostly
     bw = await install_bandwidth_saver(context, page)
 
     jmk_linked = False; jmk_released = False
@@ -1242,6 +1280,7 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         try:
             context = await browser.new_context(**new_kwargs)
             page = await context.new_page()
+            install_response_capture(page)
             bw = await install_bandwidth_saver(context, page)
             try:
                 from playwright_stealth import stealth_async
@@ -1334,27 +1373,20 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
                                      "button:has-text('Create account')"],
                              "4-create", timeout=12000)
 
-        # ---- [4.5] DIAGNOSTIC: what did the create-account click produce? ----
+        # ---- [4.5] DIAGNOSTIC ----
         await asyncio.sleep(3)
-        try:
-            body_pre = (await page.text_content("body")) or ""
-        except Exception:
-            body_pre = "(body read failed)"
+        try: body_pre = (await page.text_content("body")) or ""
+        except Exception: body_pre = "(body read failed)"
         print(f"[4.5] url after create: {page.url}")
         print(f"[4.5] body (first 1200 chars): {body_pre[:1200]!r}")
-        # look for error signals
-        error_markers = (
-            "already registered","email already","invalid email",
-            "disposable","not allowed","try again","error","failed",
-            "something went wrong","too many","blocked","forbidden",
-            "verify your email","verification code","check your email",
-            "captcha","cloudflare",
-        )
+        error_markers = ("already registered","email already","invalid email",
+                         "disposable","not allowed","try again","error","failed",
+                         "something went wrong","too many","blocked","forbidden",
+                         "verify your email","verification code","check your email",
+                         "captcha","cloudflare")
         lower_pre = body_pre.lower()
         hits = [m for m in error_markers if m in lower_pre]
-        if hits:
-            print(f"[4.5] signals in body: {hits}")
-        # snapshot the signup form still being present
+        if hits: print(f"[4.5] signals in body: {hits}")
         form_still = await page.query_selector("#signup-step-password")
         if form_still:
             print("[4.5] signup form STILL present - create-account did not advance")
@@ -1366,8 +1398,7 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
                     "iframe[src*='turnstile']")
                 if cap:
                     if CLOUD_MODE:
-                        raise Exception("captcha shown in headless cloud mode - "
-                                        "aborting this attempt so the pool rotates")
+                        raise Exception("captcha shown in headless cloud mode")
                     print("[4] Captcha - solve it manually in the browser.")
                     await relax_bandwidth_saver(context)
                     await asyncio.to_thread(input, "Press Enter after solving...")
@@ -1398,11 +1429,8 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             if TOKBOOSTLY_HOST in page.url and "/dashboard" in page.url:
                 print("[5] No code prompt - already on dashboard.")
             else:
-                # dump final page text so we know what's blocking
-                try:
-                    body2 = (await page.text_content("body")) or ""
-                except Exception:
-                    body2 = "(body read failed)"
+                try: body2 = (await page.text_content("body")) or ""
+                except Exception: body2 = "(body read failed)"
                 print(f"[5] FAILED to find code input. url={page.url}")
                 print(f"[5] body (first 1500 chars): {body2[:1500]!r}")
                 raise
@@ -1503,7 +1531,6 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             if verify_events:
                 print(f"[DIAG] verify network responses so far: {verify_events}")
 
-        # wait for the dashboard
         print("[5] Waiting for dashboard...")
         deadline = time.time() + 45
         while time.time() < deadline:
