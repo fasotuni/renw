@@ -58,9 +58,21 @@ CURL_IMPERSONATE_CANDIDATES = [
     ("chrome131", "131.0.0.0"),
     ("chrome124", "124.0.0.0"),
     ("chrome123", "123.0.0.0"),
-    ("chrome120", "120.0.0.0"),
-    ("chrome119", "119.0.0.0"),
-    ("chrome116", "116.0.0.0"),
+]
+
+# Verify-email endpoint candidates. curl_cffi will try each until one returns
+# 200 with a non-challenge body.
+VERIFY_ENDPOINT_CANDIDATES = [
+    "/api/auth/verify-email",
+    "/api/auth/verify",
+    "/api/auth/confirm-email",
+    "/api/auth/confirm",
+    "/api/auth/otp/verify",
+    "/api/auth/email/verify",
+    "/api/auth/verification/verify",
+    "/api/auth/verify-account",
+    "/api/verify-email",
+    "/api/verify",
 ]
 
 INSTA_POOL_FILE     = "insta_pool.txt"
@@ -1243,40 +1255,47 @@ async def _fill_ig_modal_and_save(page, handle, timeout=12000):
         except Exception: pass
         return False
 
-# ========== CURL_CFFI REGISTER + COOKIE HANDOFF ==========
-# The register POST goes through curl_cffi because Cloudflare lets its TLS
-# fingerprint through and blocks the browser's. But when curl_cffi does the
-# register, React in the browser never sees the response and stays on step 3.
-# Fix: run the register via curl_cffi, capture every Set-Cookie the server
-# returns, inject them into the browser context, then reload /signup/. The
-# app sees its own signup-in-progress cookies on load and jumps straight to
-# the OTP entry screen.
-
-async def curl_cffi_register(email, full_name, password, proxy_server, proxy_auth):
-    if not HAS_CURL_CFFI:
-        print("[cf-register] curl_cffi not installed")
-        return None
+# ========== CURL_CFFI REGISTER + VERIFY ==========
+async def _cffi_session(proxy_server, proxy_auth, target):
     proxy_url = proxy_url_with_auth(proxy_server, proxy_auth)
     proxies_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    try:
+        session = cffi_requests.Session(impersonate=target)
+    except Exception as e:
+        return None, None, f"{target} unsupported ({str(e)[:60]})"
+    return session, proxies_dict, None
 
+def _collect_cookies(session):
+    cookies = []
+    try:
+        for c in session.cookies.jar:
+            cookies.append({
+                "name": c.name, "value": c.value,
+                "domain": c.domain or "tokboostly.com",
+                "path": c.path or "/",
+            })
+    except Exception:
+        pass
+    return cookies
+
+def _ua_for(ua_version):
+    return (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            f"AppleWebKit/537.36 (KHTML, like Gecko) "
+            f"Chrome/{ua_version} Safari/537.36")
+
+async def cffi_register(email, full_name, password, proxy_server, proxy_auth):
+    if not HAS_CURL_CFFI:
+        print("[cf] curl_cffi missing"); return None
     payload = {
-        "fullName": full_name,
-        "email": email,
-        "password": password,
+        "fullName": full_name, "email": email, "password": password,
         "visitor_id": f"v_{''.join(random.choices('0123456789abcdef', k=32))}",
     }
-
     for target, ua_version in CURL_IMPERSONATE_CANDIDATES:
-        try:
-            session = cffi_requests.Session(impersonate=target)
-        except Exception as e:
-            print(f"[cf-register] {target}: unsupported ({str(e)[:60]})")
-            continue
-        ua = (f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              f"AppleWebKit/537.36 (KHTML, like Gecko) "
-              f"Chrome/{ua_version} Safari/537.36")
-
-        # warm up with a GET so we get a session cookie first
+        session, proxies_dict, err = await asyncio.to_thread(
+            _cffi_session, proxy_server, proxy_auth, target)
+        if err:
+            print(f"[cf-register] {err}"); continue
+        ua = _ua_for(ua_version)
         try:
             print(f"[cf-register] {target}: warm-up GET /signup/")
             r0 = await asyncio.to_thread(
@@ -1286,21 +1305,16 @@ async def curl_cffi_register(email, full_name, password, proxy_server, proxy_aut
                                    "application/xml;q=0.9,*/*;q=0.8",
                          "Accept-Language": "en-US,en;q=0.9",
                          "Upgrade-Insecure-Requests": "1"},
-                proxies=proxies_dict, timeout=30,
-            )
+                proxies=proxies_dict, timeout=30)
         except Exception as e:
-            print(f"[cf-register] {target}: warm-up error {str(e)[:100]}")
-            continue
+            print(f"[cf-register] {target}: warm-up err {str(e)[:80]}"); continue
         if r0.status_code >= 400 or "just a moment" in (r0.text or "").lower():
-            print(f"[cf-register] {target}: warm-up not clean "
-                  f"(status={r0.status_code})")
-            continue
+            print(f"[cf-register] {target}: warm-up status={r0.status_code}"); continue
         print(f"[cf-register] {target}: warm-up OK ({len(r0.text)}B)")
 
-        # the actual register POST
         try:
             print(f"[cf-register] {target}: POST /api/auth/register")
-            resp = await asyncio.to_thread(
+            r1 = await asyncio.to_thread(
                 session.post,
                 "https://tokboostly.com/api/auth/register",
                 json=payload,
@@ -1310,63 +1324,108 @@ async def curl_cffi_register(email, full_name, password, proxy_server, proxy_aut
                          "Content-Type": "application/json",
                          "Origin": "https://tokboostly.com",
                          "Referer": "https://tokboostly.com/signup/"},
-                proxies=proxies_dict, timeout=30,
-            )
+                proxies=proxies_dict, timeout=30)
         except Exception as e:
-            print(f"[cf-register] {target}: POST error {str(e)[:100]}")
-            continue
-
-        body = resp.text or ""
-        print(f"[cf-register] {target}: register status={resp.status_code}")
+            print(f"[cf-register] {target}: POST err {str(e)[:80]}"); continue
+        body = r1.text or ""
+        print(f"[cf-register] {target}: register status={r1.status_code}")
+        print(f"[cf-register] {target}: register body: {body[:500]!r}")
         if "just a moment" in body.lower():
-            print(f"[cf-register] {target}: still CF-challenged")
+            print(f"[cf-register] {target}: still CF"); continue
+        if r1.status_code not in (200, 201):
             continue
-        if resp.status_code not in (200, 201):
-            print(f"[cf-register] {target}: body: {body[:300]!r}")
-            continue
+        cookies = _collect_cookies(session)
+        names = [c["name"] for c in cookies]
+        print(f"[cf-register] {target}: register OK, cookies={names}")
+        return {"status": r1.status_code, "body": body, "cookies": cookies,
+                "target": target, "ua": ua, "ua_version": ua_version,
+                "session": session, "proxies": proxies_dict}
+    print("[cf-register] all targets failed")
+    return None
 
-        # harvest every cookie curl_cffi got back so we can replay them
-        # in the browser
-        cookies = []
-        try:
-            for c in session.cookies.jar:
-                cookies.append({
-                    "name": c.name,
-                    "value": c.value,
-                    "domain": c.domain or "tokboostly.com",
-                    "path": c.path or "/",
-                })
-        except Exception:
-            pass
-        print(f"[cf-register] {target}: register OK, "
-              f"harvested {len(cookies)} cookie(s)")
-        return {"status": resp.status_code, "body": body,
-                "cookies": cookies, "target": target, "ua": ua,
-                "ua_version": ua_version}
+async def cffi_verify_email(reg, email, otp):
+    """Try every plausible verify endpoint with the SAME curl_cffi session
+    that registered, and report which one returns 200."""
+    session = reg.get("session")
+    proxies_dict = reg.get("proxies")
+    ua = reg["ua"]
+    if not session:
+        print("[cf-verify] no session in reg result"); return None
 
-    print("[cf-register] every impersonation target failed")
+    for ep in VERIFY_ENDPOINT_CANDIDATES:
+        url = f"https://tokboostly.com{ep}"
+        # try both {email, code} and {email, otp} and {code} shapes
+        for payload in (
+            {"email": email, "code": otp},
+            {"email": email, "otp": otp},
+            {"code": otp},
+            {"otp": otp},
+        ):
+            try:
+                r = await asyncio.to_thread(
+                    session.post, url, json=payload,
+                    headers={"User-Agent": ua,
+                             "Accept": "application/json, text/plain, */*",
+                             "Accept-Language": "en-US,en;q=0.9",
+                             "Content-Type": "application/json",
+                             "Origin": "https://tokboostly.com",
+                             "Referer": "https://tokboostly.com/signup/"},
+                    proxies=proxies_dict, timeout=30)
+            except Exception as e:
+                print(f"[cf-verify] {ep} {list(payload)[1]} err {str(e)[:60]}")
+                continue
+            status = r.status_code
+            body = (r.text or "")[:200]
+            tag = f"{ep} payload={list(payload)}"
+            if status in (200, 201) and "just a moment" not in body.lower():
+                print(f"[cf-verify] OK {status} on {tag}")
+                print(f"[cf-verify] body: {body!r}")
+                cookies = _collect_cookies(session)
+                names = [c["name"] for c in cookies]
+                print(f"[cf-verify] cookies after verify: {names}")
+                return {"status": status, "body": r.text, "cookies": cookies}
+            if status != 404 and status != 400:
+                print(f"[cf-verify] {status} on {tag} body={body!r}")
+    print("[cf-verify] no verify endpoint succeeded")
     return None
 
 async def run_tokboostly_account(email, password, ig_proxies, browser,
                                  proxy_server=None, country=None,
                                  proxy_auth=None, bw_totals=None,
                                  get_fresh_proxy=None):
-    # ---- [A] register via curl_cffi FIRST, before opening the browser.
-    # We don't yet know the name that will be submitted, so generate it here
-    # and reuse it in the browser to keep the flow visually consistent.
+    # ---- [A] register via curl_cffi
     full_name = random_person_name()
-    print(f"[A] Registering via curl_cffi (full name: {full_name})...")
-    reg = await curl_cffi_register(email, full_name, password,
-                                   proxy_server, proxy_auth)
+    print(f"[A] Registering via curl_cffi (name={full_name})...")
+    reg = await cffi_register(email, full_name, password, proxy_server, proxy_auth)
     if not reg:
-        raise Exception("curl_cffi register failed on every target")
+        raise Exception("register failed on all targets")
 
-    browser_ua = reg["ua"]
+    # ---- [A2] fetch OTP from gocaria, then verify via curl_cffi
+    print("[A2] Fetching OTP from gocaria inbox...")
+    otp_ctx = await browser.new_context()
+    await install_bandwidth_saver(otp_ctx)
+    otp_page = await otp_ctx.new_page()
+    await otp_page.goto(f"{GOCARIA_URL}/{email}",
+                        timeout=30000, wait_until="domcontentloaded")
+    await asyncio.sleep(2)
+    otp, _ = await wait_for_otp_from_gocaria(otp_page,
+                                              prefer_keyword="tokboostly",
+                                              return_meta=True)
+    await otp_ctx.close()
+    print(f"[A2] got OTP: {otp}")
+
+    print("[A3] Verifying email via curl_cffi...")
+    vres = await cffi_verify_email(reg, email, otp)
+
+    # use the freshest cookie set (post-verify if available, else post-register)
+    final_cookies = (vres["cookies"] if vres else reg["cookies"])
+    print(f"[A3] final cookies: {[c['name'] for c in final_cookies]}")
+
+    # ---- [B] build browser with those cookies + matching UA ----
     browser_ver = reg["ua_version"].split(".")[0]
-
     context_kwargs = dict(
         viewport={"width":1366,"height":768},
-        user_agent=browser_ua,
+        user_agent=reg["ua"],
         locale="en-US",
         timezone_id=timezone_for(country[1]) if country else "America/New_York",
         extra_http_headers={
@@ -1393,15 +1452,12 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             raise ProxyDead(f"preflight failed for {proxy_server}")
 
     context = await browser.new_context(**context_kwargs)
-
-    # inject every cookie curl_cffi's session collected
-    if reg["cookies"]:
+    if final_cookies:
         try:
-            await context.add_cookies(reg["cookies"])
-            names = [c["name"] for c in reg["cookies"]]
-            print(f"[A] injected {len(reg['cookies'])} cookie(s): {names}")
+            await context.add_cookies(final_cookies)
+            print(f"[B] injected {len(final_cookies)} cookie(s)")
         except Exception as e:
-            print(f"[A] could not inject cookies: {e}")
+            print(f"[B] cookie inject failed: {e}")
 
     page = await context.new_page()
     install_response_capture(page)
@@ -1414,18 +1470,17 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
         if get_fresh_proxy is None: return False
         try: state = await context.storage_state()
         except Exception as e:
-            print(f"[net] could not snapshot storage state: {e}"); state = None
+            print(f"[net] state snapshot failed: {e}"); state = None
         try:
             report_bandwidth(bw, f"context pre-resurrect ({email})")
             if bw and bw_totals is not None:
-                bw_totals["wire"] += bw["wire"]
-                bw_totals["saved"] += bw["saved"]
+                bw_totals["wire"] += bw["wire"]; bw_totals["saved"] += bw["saved"]
                 bw_totals["attempts"] += 1
         except Exception: pass
         bw = None; await _safe_close(context)
         try: fresh = await get_fresh_proxy()
         except Exception as e:
-            print(f"[net] fresh proxy provider raised: {e}"); return False
+            print(f"[net] fresh provider raised: {e}"); return False
         if not fresh: return False
         new_server, new_auth, new_country, new_ig = fresh
         new_kwargs = dict(context_kwargs)
@@ -1442,134 +1497,49 @@ async def run_tokboostly_account(email, password, ig_proxies, browser,
             install_response_capture(page)
             bw = await install_bandwidth_saver(context, page)
         except Exception as e:
-            print(f"[net] could not rebuild context: {e}"); return False
+            print(f"[net] rebuild failed: {e}"); return False
         proxy_server = new_server; proxy_auth = new_auth
         country = new_country; ig_proxies = new_ig
         print(f"[net] resurrected on fresh proxy {new_server}")
         return True
 
     try:
-        # ---- [B] load signup with cookies, jump into OTP step ----
-        print("\n[B] Opening TokBoostly signup (cookies pre-injected)...")
+        # ---- [B] go to dashboard directly (already authenticated) ----
+        print("\n[B] Navigating to /dashboard/ (should be authed)...")
         try:
-            await goto_with_retry(page, TOKBOOSTLY_URL,
+            await goto_with_retry(page, "https://tokboostly.com/dashboard/",
                                   tries=GOTO_RETRIES, wait=GOTO_RETRY_WAIT, label="B")
         except ProxyDead:
             if await _resurrect():
-                await goto_with_retry(page, TOKBOOSTLY_URL,
+                await goto_with_retry(page, "https://tokboostly.com/dashboard/",
                                       tries=2, wait=GOTO_RETRY_WAIT, label="B")
             else: raise
         await asyncio.sleep(3)
+        print(f"[B] url now: {page.url}")
 
-        # The app should see its own signup-in-progress state from the
-        # cookies. It may already render the OTP step, or it might still
-        # show step 3. If step 3, click Continue on the resume path:
-        # check if "Back to sign-up options" or an OTP input is already there.
-        resumed = False
-        try:
-            otp_already = await wait_first(page, [
-                "input[inputmode='numeric']",
-                "input[autocomplete='one-time-code']",
-                "input[name='otp']",
-                "input[name='code']",
-            ], timeout=6000)
-            if otp_already:
-                print(f"[B] app already showing OTP input: {otp_already}")
-                resumed = True
-        except PlaywrightTimeoutError:
-            pass
+        # if we landed on /dashboard, great. if not (e.g. bounced to /signup or /login),
+        # retry by signing in via password
+        if "/dashboard" not in page.url:
+            print(f"[B] not on dashboard. url={page.url}")
+            # try clicking Sign in link and using the credentials
+            await goto_with_retry(page, "https://tokboostly.com/login/",
+                                  tries=2, wait=GOTO_RETRY_WAIT, label="B-login")
+            await asyncio.sleep(2)
+            await fill_first(page, ["input[type='email']",
+                                    "input[autocomplete='email']"], email, timeout=8000)
+            await fill_first(page, ["input[type='password']",
+                                    "input[autocomplete='current-password']"], password, timeout=8000)
+            await _click_and_log(page, ["button:text-is('Sign in')",
+                                         "button:has-text('Sign in')",
+                                         "button[type='submit']"], "B-signin", timeout=8000)
+            await asyncio.sleep(3)
+            print(f"[B] post-signin url: {page.url}")
 
-        if not resumed:
-            # try the full flow again but skip create-account (already done)
-            # the app may expose a "resend" or "verify" link; look for it
-            print("[B] app shows signup form, looking for resume links...")
-            resume = await click_any(page, [
-                "a:has-text('Verify')",
-                "a:has-text('verify')",
-                "button:has-text('Verify')",
-                "a:has-text('Enter code')",
-                "a:has-text('I have a code')",
-                "a:has-text('Already have a code')",
-            ], timeout=4000)
-            if resume:
-                print(f"[B] clicked resume link: {resume}")
-                await asyncio.sleep(2)
+        if "/dashboard" not in page.url:
+            await dump_page_state(page, tag="B-no-dash")
+            raise Exception(f"Could not reach dashboard (at {page.url})")
 
-        # ---- [C] email verification code ----
-        print("[C] Waiting for verification code prompt...")
-        code_sels = [
-            "input[inputmode='numeric'][placeholder*='6']",
-            "input[placeholder*='6-digit']",
-            "input[autocomplete='one-time-code']",
-            "input[inputmode='numeric']",
-            "input[name='code']",
-            "input[name='otp']",
-            "input[type='tel']",
-            "input[type='text'][maxlength='6']",
-            "input[type='text'][maxlength='1']",
-        ]
-        code_sel = None
-        try:
-            code_sel = await wait_first(page, code_sels, timeout=30000)
-            print(f"[C] code input matched: {code_sel}")
-        except PlaywrightTimeoutError:
-            if TOKBOOSTLY_HOST in page.url and "/dashboard" in page.url:
-                print("[C] already on dashboard - skipping OTP")
-            else:
-                print("[C] FAILED - dumping state")
-                await dump_page_state(page, tag="C-fail")
-                raise
-
-        if code_sel:
-            signup_t0 = time.time()
-            print("[C] Fetching code from gocaria inbox...")
-            otp_ctx = await browser.new_context()
-            await install_bandwidth_saver(otp_ctx)
-            otp_page = await otp_ctx.new_page()
-            await otp_page.goto(f"{GOCARIA_URL}/{email}",
-                                timeout=30000, wait_until="domcontentloaded")
-            await asyncio.sleep(random.uniform(1, 2))
-            otp, otp_meta = await wait_for_otp_from_gocaria(
-                otp_page, prefer_keyword="tokboostly", return_meta=True)
-            await otp_ctx.close()
-            code_arrived_at = time.time()
-            print(f"[DIAG] code='{otp}'  "
-                  f"signup->arrival={code_arrived_at - signup_t0:.1f}s")
-
-            try:
-                await page.click(code_sel)
-                await page.fill(code_sel, "")
-                await page.type(code_sel, otp, delay=random.uniform(60, 140))
-            except Exception as fill_err:
-                print(f"[DIAG] primary fill failed ({fill_err}) - trying split boxes")
-                boxes = await page.query_selector_all(
-                    "input[inputmode='numeric'], input[maxlength='1']")
-                for i, digit in enumerate(otp):
-                    if i >= len(boxes): break
-                    try:
-                        await boxes[i].fill(digit); await asyncio.sleep(0.1)
-                    except Exception: break
-            await asyncio.sleep(0.8)
-
-            print("[C] Clicking 'Verify email'...")
-            verify_btn_sels = ["button:text-is('Verify email')",
-                               "button:text-is('Verify')",
-                               "button:has-text('Verify email')"]
-            clicked_label = await click_any(page, verify_btn_sels, timeout=10000)
-            print(f"[DIAG] clicked selector: {clicked_label}")
-            await asyncio.sleep(random.uniform(2.5, 4))
-
-        print("[C] Waiting for dashboard...")
-        deadline = time.time() + 45
-        while time.time() < deadline:
-            if TOKBOOSTLY_HOST in page.url and "/dashboard" in page.url: break
-            await asyncio.sleep(1)
-        else:
-            print(f"[C] never reached dashboard. url={page.url}")
-            await dump_page_state(page, tag="C-timeout")
-            raise Exception(f"Never reached dashboard (still at {page.url})")
-        print(f"[C] On dashboard: {page.url}")
-
+        print(f"[B] On dashboard: {page.url}")
         if SAVE_BANDWIDTH:
             try: await page.evaluate("window.stop()")
             except Exception: pass
@@ -1902,7 +1872,7 @@ def gateway_details(provider="decodo"):
 async def main_flow(ip_mode="gateway", target_accounts=1, gateway=None):
     global ACTUAL_UA, ACTUAL_CHROMIUM_VERSION
     if not HAS_CURL_CFFI:
-        print("[warn] curl_cffi not installed. Install with: "
+        print("[warn] curl_cffi not installed. "
               "pip install 'curl_cffi>=0.7.0'")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS, args=[
