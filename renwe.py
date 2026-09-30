@@ -1,5 +1,5 @@
 """
-renwe.py — TokBoostly auto-registration (async Playwright + stealth)
+renwe.py — TokBoostly auto-registration (async Playwright + stealth) wif
 
 IP modes:
   [1] my own IP
